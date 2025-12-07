@@ -1,8 +1,11 @@
 package convert
 
 import (
+	"bytes"
 	"cmp"
 	"encoding/json"
+	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"path/filepath"
@@ -147,15 +150,126 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			continue
 		}
 
-		out = append(out, &ggml.Tensor{
-			Name:     t.Name(),
-			Kind:     t.Kind(),
-			Shape:    t.Shape(),
-			WriterTo: t,
-		})
+		name := t.Name()
+
+		// Skip attn_norm for global layers (every 3rd layer starting at 0: 0, 3, 6, 9, 12, 15, 18, 21)
+		// Global layers use full attention and don't have attention output normalization
+		if strings.Contains(name, "attn_norm") {
+			var layer int
+			if _, err := fmt.Sscanf(name, "layers.%d.", &layer); err == nil {
+				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
+				if layer%int(globalAttnEveryN) == 0 {
+					slog.Debug("skipping attn_norm for global layer", "layer", layer, "name", name)
+					continue
+				}
+			}
+		}
+
+		// ModernBERT uses gated FFN (GeGLU) - the mlp.Wi tensor contains both gate and up weights fused
+		// We need to split it into two separate tensors
+		if strings.Contains(name, "mlp.Wi") {
+			// Get the fused tensor data
+			shape := t.Shape()
+			slog.Debug("splitting fused tensor", "name", name, "shape", shape)
+			if len(shape) != 2 {
+				// Unexpected shape, just pass through
+				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
+				out = append(out, &ggml.Tensor{
+					Name:     name,
+					Kind:     t.Kind(),
+					Shape:    shape,
+					WriterTo: t,
+				})
+				continue
+			}
+
+			// PyTorch stores linear weights as [out_features, in_features]
+			// So shape is [2*intermediate_size, hidden_size] = [2304, 768]
+			// We need to split along dim 0 into two tensors of [intermediate_size, hidden_size]
+			dim0 := shape[0]
+			dim1 := shape[1]
+			halfDim0 := dim0 / 2
+			slog.Debug("split dimensions", "dim0", dim0, "dim1", dim1, "halfDim0", halfDim0)
+
+			// Create ffn_gate tensor (first half of rows)
+			// Apply the replacement directly: mlp.Wi -> ffn_gate
+			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
+			out = append(out, &ggml.Tensor{
+				Name:     gateName,
+				Kind:     t.Kind(),
+				Shape:    []uint64{halfDim0, dim1},
+				WriterTo: &splitTensorRows{source: t, offset: 0, rows: halfDim0},
+			})
+
+			// Create ffn_up tensor (second half of rows)
+			// Apply the replacement directly: mlp.Wi -> ffn_up
+			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
+			out = append(out, &ggml.Tensor{
+				Name:     upName,
+				Kind:     t.Kind(),
+				Shape:    []uint64{halfDim0, dim1},
+				WriterTo: &splitTensorRows{source: t, offset: halfDim0, rows: halfDim0},
+			})
+		} else {
+			out = append(out, &ggml.Tensor{
+				Name:     name,
+				Kind:     t.Kind(),
+				Shape:    t.Shape(),
+				WriterTo: t,
+			})
+		}
 	}
 
 	return out
+}
+
+// getTensorKindSize returns the size in bytes for each element type
+func getTensorKindSize(kind uint32) uint64 {
+	switch kind {
+	case tensorKindFP32: // 0
+		return 4
+	case tensorKindFP16: // 1
+		return 2
+	case tensorKindBF16: // 30
+		return 2
+	default:
+		// Unknown kind, assume FP32
+		return 4
+	}
+}
+
+// splitTensorRows handles splitting a fused tensor along dimension 0 (rows)
+type splitTensorRows struct {
+	source Tensor
+	offset uint64 // starting row
+	rows   uint64 // number of rows to extract
+}
+
+func (st *splitTensorRows) WriteTo(w io.Writer) (n int64, err error) {
+	shape := st.source.Shape()
+	if len(shape) != 2 {
+		return 0, fmt.Errorf("splitTensorRows only works with 2D tensors")
+	}
+
+	dim1 := shape[1]  // columns
+	elemSize := getTensorKindSize(st.source.Kind())
+
+	// Read the entire source tensor
+	var buf bytes.Buffer
+	if _, err := st.source.WriteTo(&buf); err != nil {
+		return 0, err
+	}
+	data := buf.Bytes()
+
+	// Calculate byte offsets
+	// Each row is dim1 elements
+	rowSizeBytes := dim1 * elemSize
+	startByte := st.offset * rowSizeBytes
+	endByte := (st.offset + st.rows) * rowSizeBytes
+
+	// Write the contiguous block of rows
+	nn, err := w.Write(data[startByte:endByte])
+	return int64(nn), err
 }
 
 func (modernBertModel) Replacements() []string {
@@ -177,7 +291,9 @@ func (modernBertModel) Replacements() []string {
 		"attention.output.dense", "attn_output",
 		"attention.output.LayerNorm", "attn_output_norm",
 		"attn_norm", "attn_output_norm",
-		"mlp.Wi", "ffn_up",
+		// ModernBERT uses gated FFN - tensors are split in Tensors() method
+		"mlp.Wgate", "ffn_gate",
+		"mlp.Wup", "ffn_up",
 		"mlp.Wo", "ffn_down",
 		"intermediate.dense", "ffn_up",
 		"output.dense", "ffn_down",
