@@ -172,6 +172,8 @@ func ConvertModel(fsys fs.FS, f *os.File) error {
 		return errors.New("unknown architecture")
 	}
 
+	slog.Debug("architecture detected", "arch", p.Architectures[0])
+
 	var conv ModelConverter
 	switch p.Architectures[0] {
 	case "LlamaForCausalLM":
@@ -202,6 +204,8 @@ func ConvertModel(fsys fs.FS, f *os.File) error {
 		conv = &qwen3VLModel{}
 	case "BertModel":
 		conv = &bertModel{}
+	case "ModernBertModel", "ModernBertForMaskedLM":
+		conv = &modernBertModel{}
 	case "CohereForCausalLM":
 		conv = &commandrModel{}
 	case "GptOssForCausalLM":

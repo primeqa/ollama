@@ -483,13 +483,22 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 		for i := range gpus {
 			gpus[i].FreeMemory -= blk0.Size() + kv[0]
 		}
+	} else if blk0, ok := layers["layers.0"]; ok {
+		// BERT-style models use "layers.N" instead of "blk.N"
+		for i := range gpus {
+			gpus[i].FreeMemory -= blk0.Size() + kv[0]
+		}
 	} else {
-		slog.Warn("model missing blk.0 layer size")
+		slog.Warn("model missing blk.0 or layers.0 layer size")
 	}
 
 	// Assign all the layers to the CPU for now, they will get reassigned later
 	for i := range s.ggml.KV().BlockCount() {
 		if blk, ok := layers[fmt.Sprintf("blk.%d", i)]; ok {
+			s.mem.CPU.Weights[i] = blk.Size()
+			s.mem.CPU.Cache[i] += kv[i]
+		} else if blk, ok := layers[fmt.Sprintf("layers.%d", i)]; ok {
+			// BERT-style models use "layers.N" instead of "blk.N"
 			s.mem.CPU.Weights[i] = blk.Size()
 			s.mem.CPU.Cache[i] += kv[i]
 		}
@@ -499,10 +508,16 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	var outputWeights uint64
 	if layer, ok := layers["output_norm"]; ok {
 		outputWeights += layer.Size()
+	} else if layer, ok := layers["final_norm"]; ok {
+		// BERT-style models use "final_norm" instead of "output_norm"
+		outputWeights += layer.Size()
 	}
 	if layer, ok := layers["output"]; ok {
 		outputWeights += layer.Size()
 	} else if layer, ok := layers["token_embd"]; ok {
+		outputWeights += layer.Size()
+	} else if layer, ok := layers["embeddings"]; ok {
+		// BERT-style models may use "embeddings" layer
 		outputWeights += layer.Size()
 	}
 	s.mem.CPU.Weights[s.totalLayers-1] = outputWeights

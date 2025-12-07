@@ -37,6 +37,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_109M:          return "109M";
         case LLM_TYPE_137M:          return "137M";
         case LLM_TYPE_140M:          return "140M";
+        case LLM_TYPE_149M:          return "149M";
         case LLM_TYPE_160M:          return "160M";
         case LLM_TYPE_190M:          return "190M";
         case LLM_TYPE_220M:          return "220M";
@@ -919,6 +920,22 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 if (hparams.n_layer == 28) {
                     type = LLM_TYPE_250M;
+                }
+            } break;
+        case LLM_ARCH_MODERNBERT:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS,    hparams.f_norm_eps);
+                ml.get_key(LLM_KV_ATTENTION_CAUSAL,           hparams.causal_attn);
+                ml.get_key(LLM_KV_POOLING_TYPE,               hparams.pooling_type);
+
+                // ModernBERT-specific parameters
+                ml.get_key(LLM_KV_ATTENTION_GLOBAL_ATTN_EVERY_N_LAYERS, hparams.global_attn_every_n_layers, (uint32_t)0);
+                ml.get_key(LLM_KV_ATTENTION_LOCAL_ATTN_WINDOW, hparams.local_attn_window, (uint32_t)0);
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_LOCAL,  hparams.rope_freq_base_local,  10000.0f);
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
+
+                if (hparams.n_layer == 22 && hparams.n_embd == 768) {
+                    type = LLM_TYPE_149M; // granite-embedding-english-r2
                 }
             } break;
         case LLM_ARCH_BLOOM:
@@ -3050,6 +3067,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_NOMIC_BERT:
             case LLM_ARCH_NOMIC_BERT_MOE:
             case LLM_ARCH_JINA_BERT_V3:
+            case LLM_ARCH_MODERNBERT:
                 {
                     tok_embd     = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
                     type_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_token_types}, TENSOR_NOT_REQUIRED);
@@ -7025,6 +7043,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
         case LLM_ARCH_NEO_BERT:
+        case LLM_ARCH_MODERNBERT:
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
@@ -7182,6 +7201,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
+        case LLM_ARCH_MODERNBERT:
             {
                 llm = std::make_unique<llm_build_bert>(*this, params);
             } break;
@@ -7749,6 +7769,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
+        case LLM_ARCH_MODERNBERT:
         case LLM_ARCH_STABLELM:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_QWEN:

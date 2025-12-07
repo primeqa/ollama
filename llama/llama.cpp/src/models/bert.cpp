@@ -37,6 +37,10 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // ModernBERT: Check if we need alternating attention pattern
+    const bool use_alternating_attn = (model.arch == LLM_ARCH_MODERNBERT &&
+                                       hparams.global_attn_every_n_layers > 0);
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * cur = inpL;
 
@@ -89,17 +93,30 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
             // RoPE
             if (model.arch == LLM_ARCH_NOMIC_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
-                model.arch == LLM_ARCH_JINA_BERT_V3) {
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                model.arch == LLM_ARCH_JINA_BERT_V3 || model.arch == LLM_ARCH_MODERNBERT) {
+
+                // ModernBERT: Use different RoPE theta for global vs local layers
+                float rope_freq_base_layer = freq_base;
+                if (use_alternating_attn) {
+                    const bool is_global_layer = (il % hparams.global_attn_every_n_layers == 0);
+                    rope_freq_base_layer = is_global_layer ? hparams.rope_freq_base_global
+                                                           : hparams.rope_freq_base_local;
+                }
+
+                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, rope_freq_base_layer, freq_scale,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
 
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
+                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, rope_freq_base_layer, freq_scale,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
             }
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
+
+            // Note: ModernBERT's sliding window attention for local layers is not yet implemented
+            // Current implementation uses full attention on all layers, with alternating RoPE theta
+            // TODO: Implement bidirectional sliding window masking for local attention layers
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].bo,
@@ -139,6 +156,14 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
                     model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
                     NULL, NULL, NULL,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
+                    LLM_FFN_GELU, LLM_FFN_SEQ, il);
+            cb(cur, "ffn_out", il);
+        } else if (model.arch == LLM_ARCH_MODERNBERT) {
+            // ModernBERT has no bias terms
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up, NULL, NULL,
+                    NULL, NULL, NULL,
+                    model.layers[il].ffn_down, NULL, NULL, NULL,
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
