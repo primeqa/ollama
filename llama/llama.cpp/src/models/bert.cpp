@@ -1,4 +1,5 @@
 #include "models.h"
+#include <stdexcept>
 
 
 
@@ -50,6 +51,19 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             ggml_tensor * Vcur;
 
             // self-attention
+            // Check for ModernBERT that critical tensors exist
+            if (model.arch == LLM_ARCH_MODERNBERT) {
+                if (!model.layers[il].wqkv && (!model.layers[il].wq || !model.layers[il].wk || !model.layers[il].wv)) {
+                    throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention weight tensors");
+                }
+                if (!model.layers[il].wo) {
+                    throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output tensor (wo)");
+                }
+                if (!model.layers[il].attn_out_norm) {
+                    throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output norm tensor");
+                }
+            }
+
             if (model.layers[il].wqkv) {
                 cur = build_lora_mm(model.layers[il].wqkv, cur);
                 cb(cur, "wqkv", il);
@@ -160,6 +174,10 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_MODERNBERT) {
             // ModernBERT has no bias terms
+            // Check that required tensors exist before using them
+            if (model.layers[il].ffn_up == nullptr || model.layers[il].ffn_down == nullptr) {
+                throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing required FFN tensors (ffn_up or ffn_down)");
+            }
             cur = build_ffn(cur,
                     model.layers[il].ffn_up, NULL, NULL,
                     NULL, NULL, NULL,
