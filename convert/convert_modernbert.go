@@ -140,13 +140,13 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 
 func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	var out []*ggml.Tensor
+	skippedCount := 0
+	mlpWiCount := 0
 
-	// Debug: Log all bias tensors to understand what we have
-	slog.Info("=== Analyzing all bias tensors ===")
+	// Debug: Log all input tensors
+	slog.Info("=== INPUT TENSORS ===", "total", len(ts))
 	for _, t := range ts {
-		if strings.Contains(t.Name(), ".bias") {
-			slog.Info("Found bias tensor", "name", t.Name())
-		}
+		slog.Info("Input tensor", "name", t.Name(), "shape", t.Shape())
 	}
 
 	for _, t := range ts {
@@ -156,7 +156,8 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			"pooler.dense.weight",
 			"pooler.dense.bias",
 		}, t.Name()) {
-			slog.Debug("skipping pooler/position tensor", "name", t.Name())
+			slog.Info("SKIPPING pooler/position tensor", "name", t.Name())
+			skippedCount++
 			continue
 		}
 
@@ -166,25 +167,35 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 		// Full attention layers don't have attention biases while local attention layers do
 		// Don't skip normalization biases (attn_output_norm.bias)
 		if strings.Contains(name, ".bias") && !strings.Contains(name, "norm") && (strings.Contains(name, "attn") || strings.Contains(name, "attention")) {
+			// Apply layer prefix replacements to parse the layer number correctly
+			layerName := name
+			layerName = strings.Replace(layerName, "encoder.layer.", "blk.", 1)
+			layerName = strings.Replace(layerName, "encoder.layers.", "blk.", 1)
+			layerName = strings.Replace(layerName, "layers.", "blk.", 1)
+
 			var layer int
-			if _, err := fmt.Sscanf(name, "blk.%d.", &layer); err == nil {
+			if _, err := fmt.Sscanf(layerName, "blk.%d.", &layer); err == nil {
 				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
 				// Skip if it's a global layer (multiple of N) - this includes layer 0
 				if layer%int(globalAttnEveryN) == 0 {
 					slog.Info("SKIPPING attention bias for global layer", "layer", layer, "name", name)
+					skippedCount++
 					continue
 				} else {
-					slog.Debug("keeping attention bias for local layer", "layer", layer, "name", name)
+					slog.Info("KEEPING attention bias for local layer", "layer", layer, "name", name)
 				}
+			} else {
+				slog.Warn("Failed to parse layer number from attention bias tensor", "name", name, "layerName", layerName)
 			}
 		}
 
 		// ModernBERT uses gated FFN (GeGLU) - the mlp.Wi tensor contains both gate and up weights fused
 		// We need to split it into two separate tensors
 		if strings.Contains(name, "mlp.Wi") {
+			mlpWiCount++
 			// Get the fused tensor data
 			shape := t.Shape()
-			slog.Debug("splitting fused tensor", "name", name, "shape", shape)
+			slog.Info("SPLITTING fused mlp.Wi tensor", "name", name, "shape", shape)
 			if len(shape) != 2 {
 				// Unexpected shape, just pass through
 				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
@@ -208,6 +219,7 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			// Create ffn_gate tensor (first half of rows)
 			// Apply the replacement directly: mlp.Wi -> ffn_gate
 			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
+			slog.Info("Creating ffn_gate from mlp.Wi", "name", gateName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     gateName,
 				Kind:     t.Kind(),
@@ -218,6 +230,7 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			// Create ffn_up tensor (second half of rows)
 			// Apply the replacement directly: mlp.Wi -> ffn_up
 			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
+			slog.Info("Creating ffn_up from mlp.Wi", "name", upName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     upName,
 				Kind:     t.Kind(),
@@ -233,6 +246,38 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			})
 		}
 	}
+
+	// Special case: Layer 0 in ModernBERT doesn't have attn_output_norm in the source model
+	// because input is already normalized from embeddings.norm. But llama.cpp expects it,
+	// so we create a synthetic one by copying embeddings.norm
+	hasLayer0AttnNorm := false
+	var embeddingsNormTensor *ggml.Tensor
+
+	for _, t := range out {
+		if t.Name == "blk.0.attn_output_norm.weight" {
+			hasLayer0AttnNorm = true
+		}
+		if t.Name == "token_embd_norm.weight" {
+			embeddingsNormTensor = t
+		}
+	}
+
+	if !hasLayer0AttnNorm && embeddingsNormTensor != nil {
+		slog.Info("Layer 0 missing attn_output_norm, creating from token_embd_norm")
+		out = append(out, &ggml.Tensor{
+			Name:     "blk.0.attn_output_norm.weight",
+			Kind:     embeddingsNormTensor.Kind,
+			Shape:    embeddingsNormTensor.Shape,
+			WriterTo: embeddingsNormTensor.WriterTo,
+		})
+	}
+
+	slog.Info("=== TENSOR CONVERSION SUMMARY ===",
+		"input_tensors", len(ts),
+		"skipped_tensors", skippedCount,
+		"mlp_wi_split_count", mlpWiCount,
+		"output_tensors", len(out),
+		"net_change", len(out)-len(ts)+skippedCount)
 
 	return out
 }
