@@ -87,8 +87,6 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 	}
 
 	// ModernBERT uses CLS pooling by default based on classifier_pooling
-	// Debug: log what we're seeing
-	slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling, "pooling_path", pooling)
 	if p.ClassifierPooling == "mean" {
 		p.PoolingType = 1 // Mean pooling
 	} else {
@@ -143,12 +141,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	skippedCount := 0
 	mlpWiCount := 0
 
-	// Debug: Log all input tensors
-	slog.Info("=== INPUT TENSORS ===", "total", len(ts))
-	for _, t := range ts {
-		slog.Info("Input tensor", "name", t.Name(), "shape", t.Shape())
-	}
-
 	for _, t := range ts {
 		// Skip pooler layers and position IDs (we do pooling in the runtime)
 		if slices.Contains([]string{
@@ -156,7 +148,7 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			"pooler.dense.weight",
 			"pooler.dense.bias",
 		}, t.Name()) {
-			slog.Info("SKIPPING pooler/position tensor", "name", t.Name())
+			slog.Debug("skipping pooler/position tensor", "name", t.Name())
 			skippedCount++
 			continue
 		}
@@ -178,14 +170,10 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
 				// Skip if it's a global layer (multiple of N) - this includes layer 0
 				if layer%int(globalAttnEveryN) == 0 {
-					slog.Info("SKIPPING attention bias for global layer", "layer", layer, "name", name)
+					slog.Debug("skipping attention bias for global layer", "layer", layer, "name", name)
 					skippedCount++
 					continue
-				} else {
-					slog.Info("KEEPING attention bias for local layer", "layer", layer, "name", name)
 				}
-			} else {
-				slog.Warn("Failed to parse layer number from attention bias tensor", "name", name, "layerName", layerName)
 			}
 		}
 
@@ -195,10 +183,10 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			mlpWiCount++
 			// Get the fused tensor data
 			shape := t.Shape()
-			slog.Info("SPLITTING fused mlp.Wi tensor", "name", name, "shape", shape)
+			slog.Debug("splitting fused mlp.Wi tensor", "name", name, "shape", shape)
 			if len(shape) != 2 {
 				// Unexpected shape, just pass through
-				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
+				slog.Debug("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
 				out = append(out, &ggml.Tensor{
 					Name:     name,
 					Kind:     t.Kind(),
@@ -219,7 +207,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			// Create ffn_gate tensor (first half of rows)
 			// Apply the replacement directly: mlp.Wi -> ffn_gate
 			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
-			slog.Info("Creating ffn_gate from mlp.Wi", "name", gateName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     gateName,
 				Kind:     t.Kind(),
@@ -230,7 +217,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			// Create ffn_up tensor (second half of rows)
 			// Apply the replacement directly: mlp.Wi -> ffn_up
 			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
-			slog.Info("Creating ffn_up from mlp.Wi", "name", upName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     upName,
 				Kind:     t.Kind(),
@@ -263,7 +249,7 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	}
 
 	if !hasLayer0AttnNorm && embeddingsNormTensor != nil {
-		slog.Info("Layer 0 missing attn_output_norm, creating from token_embd_norm")
+		slog.Debug("creating blk.0.attn_output_norm from token_embd_norm")
 		out = append(out, &ggml.Tensor{
 			Name:     "blk.0.attn_output_norm.weight",
 			Kind:     embeddingsNormTensor.Kind,
@@ -271,13 +257,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			WriterTo: embeddingsNormTensor.WriterTo,
 		})
 	}
-
-	slog.Info("=== TENSOR CONVERSION SUMMARY ===",
-		"input_tensors", len(ts),
-		"skipped_tensors", skippedCount,
-		"mlp_wi_split_count", mlpWiCount,
-		"output_tensors", len(out),
-		"net_change", len(out)-len(ts)+skippedCount)
 
 	return out
 }
