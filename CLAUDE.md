@@ -181,3 +181,114 @@ Ollama looks for acceleration libraries relative to the `ollama` executable:
 - `../lib/ollama` (Linux)
 - `.` (macOS)
 - `build/lib/ollama` (development)
+
+## ModernBERT Implementation Notes
+
+### Architecture Overview
+ModernBERT uses an alternating attention pattern:
+- **Global attention layers**: Every Nth layer (typically N=3, configurable via `global_attn_every_n_layers`)
+- **Local attention layers**: All other layers use sliding window attention
+- Example: For 22-layer model with N=3, layers 0, 3, 6, 9, 12, 15, 18, 21 are global
+
+### Critical Tensor Handling in `convert/convert_modernbert.go`
+
+**Attention Bias Tensors** (lines 155-168):
+- Global attention layers do NOT have attention projection bias tensors
+- Local attention layers DO have attention projection bias tensors
+- ALL layers (both global and local) have normalization bias tensors (e.g., `attn_output_norm.bias`)
+- The skip logic filters: `strings.Contains(name, ".bias") && !strings.Contains(name, "norm") && (strings.Contains(name, "attn") || strings.Contains(name, "attention"))`
+- This skips attention projection biases for global layers while preserving normalization biases
+
+**Gated FFN (GeGLU)** (lines 171-215):
+- ModernBERT uses gated feed-forward networks
+- The `mlp.Wi` tensor contains both gate and up weights fused as `[2*intermediate_size, hidden_size]`
+- Must be split into two separate tensors:
+  - `ffn_gate`: first half of rows `[intermediate_size, hidden_size]`
+  - `ffn_up`: second half of rows `[intermediate_size, hidden_size]`
+- Implemented via `splitTensorRows` helper
+
+**Tensor Name Replacements**:
+The `Replacements()` method transforms tensor names BEFORE `Tensors()` processes them:
+- `layers` → `blk`
+- `attention.output.LayerNorm` → `attn_output_norm`
+- Pattern matching in `Tensors()` must use POST-replacement names (e.g., `blk.%d.`, not `layers.%d.`)
+
+### Testing ModernBERT Models
+
+After converting a ModernBERT model, the expected tensor count depends on:
+- Number of layers (e.g., 22 for granite-embedding-r2)
+- Global attention layer count (layers where `layer % global_attn_every_n_layers == 0`)
+- Each local layer has more tensors due to attention projection biases
+
+Example test model: `ibm-granite/granite-embedding-english-r2`
+- 22 layers (0-21)
+- Global layers: 0, 3, 6, 9, 12, 15, 18, 21 (8 layers)
+- Local layers: 1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 19, 20 (14 layers)
+- Expected tensor count: 156 (for this specific model)
+
+### Build and Test Workflow
+
+When modifying ModernBERT conversion logic:
+```bash
+# 1. Clean build cache (important after native code changes)
+go clean -cache
+
+# 2. Rebuild native code (if ml/backend/ggml/ was modified)
+cmake --build build
+
+# 3. Build Go binary
+go build .
+
+# 4. Kill any existing ollama processes
+pkill -9 -f ollama
+
+# 5. Start the server (CPU-only for testing)
+OLLAMA_HOST=127.0.0.1:11434 CUDA_VISIBLE_DEVICES="" ./ollama serve > /tmp/ollama_server.log 2>&1 &
+
+# 6. Wait for server to be ready
+sleep 4 && curl -s http://127.0.0.1:11434/ > /dev/null && echo "Server ready"
+
+# 7. Test conversion with granite-embedding-r2
+OLLAMA_HOST=127.0.0.1:11434 ./ollama create granite-r2 -f - <<EOF
+FROM /tmp/granite-r2
+EOF
+
+# 8. Check server logs for errors
+tail -20 /tmp/ollama_server.log
+
+# 9. Test embedding generation (if conversion succeeded)
+OLLAMA_HOST=127.0.0.1:11434 ./ollama run granite-r2 "Test embedding"
+
+# 10. Clean up
+OLLAMA_HOST=127.0.0.1:11434 ./ollama rm granite-r2
+pkill -9 -f ollama
+```
+
+Alternative: Test on different port to avoid conflicts:
+```bash
+# Use port 13000 instead
+OLLAMA_HOST=127.0.0.1:13000 CUDA_VISIBLE_DEVICES="" ./ollama serve > /tmp/port13000.log 2>&1 &
+sleep 4
+OLLAMA_HOST=127.0.0.1:13000 ./ollama create granite-r2 -f - <<EOF
+FROM /tmp/granite-r2
+EOF
+```
+
+### Common Issues
+
+**"unknown architecture" error**:
+- Verify converter is registered in `convert/convert.go` for the architecture name
+- Check that `config.json` has correct `model_type` or `architectures` field
+- Kill all running ollama processes to ensure new binary is used: `pkill -9 -f ollama`
+- **IMPORTANT**: If trying to override an existing model, remove it first and wait 3-4 seconds:
+  ```bash
+  OLLAMA_HOST=127.0.0.1:13000 ./ollama rm granite-r2
+  sleep 4
+  OLLAMA_HOST=127.0.0.1:13000 ./ollama create granite-r2 -f /path/to/Modelfile
+  ```
+
+**Tensor count mismatch**:
+- Analyze which layers should/shouldn't have bias tensors
+- Verify skip logic in `Tensors()` matches the model's actual structure
+- Add debug logging: `slog.Debug("skipping tensor", "name", name, "layer", layer)`
+- Compare expected count from error message with actual model architecture

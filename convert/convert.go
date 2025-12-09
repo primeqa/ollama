@@ -158,17 +158,34 @@ func ConvertAdapter(fsys fs.FS, f *os.File, baseKV ggml.KV) error {
 // Supported input model formats include safetensors.
 // Supported input tokenizers files include tokenizer.json (preferred) and tokenizer.model.
 func ConvertModel(fsys fs.FS, f *os.File) error {
+	// Debug: list all files in the filesystem
+	slog.Info("=== Files in conversion directory ===")
+	fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			slog.Info("Found file", "path", path)
+		}
+		return nil
+	})
+
 	bts, err := fs.ReadFile(fsys, "config.json")
 	if err != nil {
+		slog.Error("failed to read config.json", "error", err)
 		return err
 	}
+
+	slog.Info("Read config.json", "size", len(bts), "preview", string(bts[:min(200, len(bts))]))
 
 	var p ModelParameters
 	if err := json.Unmarshal(bts, &p); err != nil {
+		slog.Error("failed to unmarshal config.json", "error", err)
 		return err
 	}
 
+
+   slog.Debug("model parameters", "params", p)
+
 	if len(p.Architectures) < 1 {
+		slog.Error("no architectures found in config", "architectures", p.Architectures)
 		return errors.New("unknown architecture")
 	}
 

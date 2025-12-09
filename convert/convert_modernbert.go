@@ -140,6 +140,15 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 
 func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	var out []*ggml.Tensor
+
+	// Debug: Log all bias tensors to understand what we have
+	slog.Info("=== Analyzing all bias tensors ===")
+	for _, t := range ts {
+		if strings.Contains(t.Name(), ".bias") {
+			slog.Info("Found bias tensor", "name", t.Name())
+		}
+	}
+
 	for _, t := range ts {
 		// Skip pooler layers and position IDs (we do pooling in the runtime)
 		if slices.Contains([]string{
@@ -147,20 +156,25 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			"pooler.dense.weight",
 			"pooler.dense.bias",
 		}, t.Name()) {
+			slog.Debug("skipping pooler/position tensor", "name", t.Name())
 			continue
 		}
 
 		name := t.Name()
 
-		// Skip attn_norm for global layers (every 3rd layer starting at 0: 0, 3, 6, 9, 12, 15, 18, 21)
-		// Global layers use full attention and don't have attention output normalization
-		if strings.Contains(name, "attn_norm") {
+		// Skip attention projection bias tensors for global attention layers
+		// Full attention layers don't have attention biases while local attention layers do
+		// Don't skip normalization biases (attn_output_norm.bias)
+		if strings.Contains(name, ".bias") && !strings.Contains(name, "norm") && (strings.Contains(name, "attn") || strings.Contains(name, "attention")) {
 			var layer int
-			if _, err := fmt.Sscanf(name, "layers.%d.", &layer); err == nil {
+			if _, err := fmt.Sscanf(name, "blk.%d.", &layer); err == nil {
 				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
+				// Skip if it's a global layer (multiple of N) - this includes layer 0
 				if layer%int(globalAttnEveryN) == 0 {
-					slog.Debug("skipping attn_norm for global layer", "layer", layer, "name", name)
+					slog.Info("SKIPPING attention bias for global layer", "layer", layer, "name", name)
 					continue
+				} else {
+					slog.Debug("keeping attention bias for local layer", "layer", layer, "name", name)
 				}
 			}
 		}
