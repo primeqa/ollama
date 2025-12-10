@@ -1,7 +1,42 @@
 #include "models.h"
 #include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
+// Debug function to dump tensor activations to disk
+static void dump_tensor_to_file(const char* name, struct ggml_tensor* tensor, int layer_idx) {
+    if (getenv("OLLAMA_DEBUG_ACTIVATIONS") == nullptr) return;
 
+    // Compute tensor first to ensure data is available
+    // Note: This assumes the tensor has been computed before this call
+
+    char filename[512];
+    if (layer_idx >= 0) {
+        snprintf(filename, sizeof(filename), "/tmp/ollama_layer_%02d_%s.bin", layer_idx, name);
+    } else {
+        snprintf(filename, sizeof(filename), "/tmp/ollama_%s.bin", name);
+    }
+
+    FILE* f = fopen(filename, "wb");
+    if (f) {
+        // Get tensor data and size
+        void* data = ggml_get_data(tensor);
+        size_t nbytes = ggml_nbytes(tensor);
+
+        // Write tensor data
+        size_t written = fwrite(data, 1, nbytes, f);
+        fclose(f);
+
+        fprintf(stderr, "[DEBUG] Dumped %s (layer %d): shape=[%lld, %lld, %lld, %lld], size=%zu bytes, written=%zu\n",
+                name, layer_idx,
+                (long long)tensor->ne[0], (long long)tensor->ne[1],
+                (long long)tensor->ne[2], (long long)tensor->ne[3],
+                nbytes, written);
+    } else {
+        fprintf(stderr, "[ERROR] Failed to open %s for writing\n", filename);
+    }
+}
 
 llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -33,6 +68,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     // embed layer norm
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
     cb(inpL, "inp_norm", -1);
+    dump_tensor_to_file("inp_norm", inpL, -1);
 
     auto * inp_attn = build_attn_inp_no_cache();
 
@@ -173,16 +209,18 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_MODERNBERT) {
-            // ModernBERT has no bias terms
-            // Check that required tensors exist before using them
-            if (model.layers[il].ffn_up == nullptr || model.layers[il].ffn_down == nullptr) {
-                throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing required FFN tensors (ffn_up or ffn_down)");
+            // ModernBERT uses GeGLU (Gated GELU) activation with no bias terms
+            // FFN flow: x -> [gate, up] -> GELU(gate) * up -> down
+            // Note: We use LLM_FFN_GELU + LLM_FFN_PAR because gate and up are separate tensors
+            // (LLM_FFN_GEGLU is for fused tensors only)
+            if (model.layers[il].ffn_gate == nullptr || model.layers[il].ffn_up == nullptr || model.layers[il].ffn_down == nullptr) {
+                throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing required FFN tensors");
             }
             cur = build_ffn(cur,
                     model.layers[il].ffn_up, NULL, NULL,
-                    NULL, NULL, NULL,
+                    model.layers[il].ffn_gate, NULL, NULL,
                     model.layers[il].ffn_down, NULL, NULL, NULL,
-                    LLM_FFN_GELU, LLM_FFN_SEQ, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
             cur = build_ffn(cur,
@@ -211,6 +249,12 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     }
 
     cur = inpL;
+
+    // ModernBERT: Apply final normalization layer
+    if (model.arch == LLM_ARCH_MODERNBERT && model.output_norm) {
+        cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
+        cb(cur, "result_norm", -1);
+    }
 
     cb(cur, "result_embd", -1);
     res->t_embd = cur;

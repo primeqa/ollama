@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -55,44 +54,31 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 		return err
 	}
 
-	var pooling string
+	var hasPoolingModule bool
 	for _, m := range modules {
 		switch m.Type {
 		case "sentence_transformers.models.Pooling":
-			pooling = m.Path
+			hasPoolingModule = true
 		case "sentence_transformers.models.Normalize":
 			p.normalizeEmbeddings = true
 		}
 	}
 
-	if pooling != "" {
-		bts, err := fs.ReadFile(fsys, filepath.Join(pooling, "config.json"))
-		if err == nil {
-			var pc struct {
-				PoolingModeCLSToken   bool `json:"pooling_mode_cls_token"`
-				PoolingModeMeanTokens bool `json:"pooling_mode_mean_tokens"`
-			}
-
-			if err := json.Unmarshal(bts, &pc); err == nil {
-				if pc.PoolingModeMeanTokens {
-					p.PoolingType = 1 // Mean pooling
-					return nil
-				} else if pc.PoolingModeCLSToken {
-					p.PoolingType = 2 // CLS pooling
-					return nil
-				}
-			}
-		}
-		// If pooling config file missing or invalid, fall through to default
-	}
-
-	// ModernBERT uses CLS pooling by default based on classifier_pooling
-	// Debug: log what we're seeing
-	slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling, "pooling_path", pooling)
-	if p.ClassifierPooling == "mean" {
-		p.PoolingType = 1 // Mean pooling
+	// ModernBERT embedding models use CLS pooling (first token)
+	// The modules.json indicates this is a sentence-transformers model with a Pooling module
+	// These embedding models should use CLS token pooling, not the classifier_pooling setting
+	// (classifier_pooling is for classification heads, not embeddings)
+	if hasPoolingModule {
+		slog.Debug("modernbert: detected sentence-transformers Pooling module, using CLS pooling")
+		p.PoolingType = 2 // CLS pooling for embedding models
 	} else {
-		p.PoolingType = 2 // CLS pooling (default)
+		// No pooling module - fall back to classifier_pooling setting
+		slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling)
+		if p.ClassifierPooling == "mean" {
+			p.PoolingType = 1 // Mean pooling
+		} else {
+			p.PoolingType = 2 // CLS pooling (default)
+		}
 	}
 
 	return nil
@@ -189,13 +175,12 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			}
 		}
 
-		// ModernBERT uses gated FFN (GeGLU) - the mlp.Wi tensor contains both gate and up weights fused
+		// ModernBERT uses GeGLU (Gated GELU) - the mlp.Wi tensor contains both gate and up weights fused
 		// We need to split it into two separate tensors
 		if strings.Contains(name, "mlp.Wi") {
-			mlpWiCount++
 			// Get the fused tensor data
 			shape := t.Shape()
-			slog.Info("SPLITTING fused mlp.Wi tensor", "name", name, "shape", shape)
+			slog.Info("Splitting fused mlp.Wi tensor for GeGLU", "name", name, "shape", shape)
 			if len(shape) != 2 {
 				// Unexpected shape, just pass through
 				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
@@ -209,17 +194,17 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			}
 
 			// PyTorch stores linear weights as [out_features, in_features]
-			// So shape is [2*intermediate_size, hidden_size] = [2304, 768]
+			// For GeGLU, shape is [2*intermediate_size, hidden_size]
 			// We need to split along dim 0 into two tensors of [intermediate_size, hidden_size]
 			dim0 := shape[0]
 			dim1 := shape[1]
 			halfDim0 := dim0 / 2
-			slog.Debug("split dimensions", "dim0", dim0, "dim1", dim1, "halfDim0", halfDim0)
+			slog.Debug("GeGLU split dimensions", "dim0", dim0, "dim1", dim1, "halfDim0", halfDim0)
 
 			// Create ffn_gate tensor (first half of rows)
-			// Apply the replacement directly: mlp.Wi -> ffn_gate
+			// ModernBERT's mlp.Wi is organized as [gate; up] (concatenated along dim 0)
 			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
-			slog.Info("Creating ffn_gate from mlp.Wi", "name", gateName, "shape", []uint64{halfDim0, dim1})
+			slog.Info("Creating ffn_gate from mlp.Wi (first half)", "name", gateName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     gateName,
 				Kind:     t.Kind(),
@@ -228,9 +213,8 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			})
 
 			// Create ffn_up tensor (second half of rows)
-			// Apply the replacement directly: mlp.Wi -> ffn_up
 			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
-			slog.Info("Creating ffn_up from mlp.Wi", "name", upName, "shape", []uint64{halfDim0, dim1})
+			slog.Info("Creating ffn_up from mlp.Wi (second half)", "name", upName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     upName,
 				Kind:     t.Kind(),
