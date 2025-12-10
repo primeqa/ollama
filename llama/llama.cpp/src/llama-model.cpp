@@ -934,6 +934,17 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_LOCAL,  hparams.rope_freq_base_local,  10000.0f);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
 
+                // Configure sliding window attention for local layers
+                // Local layers (not divisible by global_attn_every_n_layers) use sliding window
+                // Global layers (divisible by global_attn_every_n_layers) use full attention
+                if (hparams.local_attn_window > 0 && hparams.global_attn_every_n_layers > 0) {
+                    // ModernBERT uses bidirectional sliding window (±64 tokens)
+                    hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;
+                    hparams.n_swa = hparams.local_attn_window;
+                    // dense_first=true inverts pattern: non-multiples get sliding window, multiples get full attention
+                    hparams.set_swa_pattern(hparams.global_attn_every_n_layers, true);
+                }
+
                 if (hparams.n_layer == 22 && hparams.n_embd == 768) {
                     type = LLM_TYPE_149M; // granite-embedding-english-r2
                 }
