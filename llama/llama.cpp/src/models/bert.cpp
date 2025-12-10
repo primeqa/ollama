@@ -212,6 +212,12 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
     cur = inpL;
 
+    // ModernBERT: Apply final normalization before outputting embeddings
+    if (model.arch == LLM_ARCH_MODERNBERT && model.output_norm) {
+        cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
+        cb(cur, "result_norm", -1);
+    }
+
     cb(cur, "result_embd", -1);
     res->t_embd = cur;
 

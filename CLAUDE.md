@@ -292,3 +292,64 @@ EOF
 - Verify skip logic in `Tensors()` matches the model's actual structure
 - Add debug logging: `slog.Debug("skipping tensor", "name", name, "layer", layer)`
 - Compare expected count from error message with actual model architecture
+
+### Alternating Attention Implementation
+
+ModernBERT's alternating attention pattern has been implemented with the following components:
+
+**1. Sliding Window Attention Configuration** (`llama/llama.cpp/src/llama-model.cpp:937-946`):
+- Uses `LLAMA_SWA_TYPE_SYMMETRIC` for bidirectional sliding window (±64 tokens)
+- Configured via `hparams.swa_type`, `hparams.n_swa`, and `hparams.set_swa_pattern()`
+- `dense_first=true` inverts the pattern: non-multiples of `global_attn_every_n_layers` get sliding window
+- Global layers (0, 3, 6, 9, 12, 15, 18, 21) use full attention
+- Local layers (all others) use 128-token sliding window (±64)
+
+**2. Alternating RoPE Theta** (`llama/llama.cpp/src/models/bert.cpp:112-118`):
+- Global layers: `rope_freq_base_global` = 80000.0
+- Local layers: `rope_freq_base_local` = 10000.0
+- Applied per-layer in the attention computation
+
+**3. CLS Pooling Fix** (`convert/convert_modernbert.go:89-92`):
+- ModernBERT embedding models use CLS pooling (type 2), not mean pooling
+- The `classifier_pooling` config field is for classification heads, not embeddings
+- Always use `PoolingType = 2` for embedding models
+
+**4. Final Normalization** (`llama/llama.cpp/src/models/bert.cpp:215-219`):
+- Apply `output_norm` layer before outputting embeddings
+- The `final_norm.weight` tensor is mapped to `output_norm.weight` in GGUF
+
+**5. Embedding Comparison Tool** (`compare_embeddings.py`):
+- Compares Ollama embeddings with HuggingFace SentenceTransformers reference
+- Usage: `python compare_embeddings.py sample_data.jsonl --json-path text`
+- Reports cosine similarity statistics and distribution
+
+### Current Status and Known Issues
+
+**Implementation Complete**:
+- ✅ Symmetric sliding window attention (±64 tokens for local layers)
+- ✅ Alternating RoPE theta (10k for local, 80k for global)
+- ✅ CLS pooling for embeddings
+- ✅ Final normalization layer
+- ✅ Gated FFN (GeGLU) tensor splitting
+- ✅ Synthetic layer 0 attn_output_norm tensor
+
+**Outstanding Issue - Poor Embedding Quality**:
+- Current cosine similarity: ~0.493 (expected: >0.99)
+- The model loads and runs without errors
+- All architectural features are implemented
+- Embeddings are fundamentally different from reference implementation
+- Suggests a deeper issue in tensor operations or attention computation
+
+**Debugging Steps Taken**:
+1. Verified sliding window mask is created and applied correctly
+2. Confirmed CLS pooling is active (pooling_type = 2)
+3. Verified final normalization is applied
+4. Checked tensor names and shapes match expected values
+5. Confirmed all 157 tensors load successfully
+
+**Further Investigation Needed**:
+- Compare intermediate tensor values with Python reference
+- Verify attention mask application in forward pass
+- Check for numerical precision issues
+- Validate tensor ordering and indexing
+- Examine pooling implementation details

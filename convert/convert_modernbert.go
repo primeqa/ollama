@@ -86,12 +86,10 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 		// If pooling config file missing or invalid, fall through to default
 	}
 
-	// ModernBERT uses CLS pooling by default based on classifier_pooling
-	if p.ClassifierPooling == "mean" {
-		p.PoolingType = 1 // Mean pooling
-	} else {
-		p.PoolingType = 2 // CLS pooling (default)
-	}
+	// ModernBERT embedding models use CLS pooling by default
+	// Note: classifier_pooling is for the classification head, not for embeddings
+	// So we should not use it to determine the embedding pooling type
+	p.PoolingType = 2 // CLS pooling (default for embeddings)
 
 	return nil
 }
