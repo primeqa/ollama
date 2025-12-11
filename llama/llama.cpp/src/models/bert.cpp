@@ -1,4 +1,5 @@
 #include "models.h"
+#include "../llama-impl.h"
 #include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
@@ -255,6 +256,10 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
         cb(cur, "result_norm", -1);
     }
+
+    // DEBUG: Log tensor shape before pooling
+    LLAMA_LOG_INFO("[BERT DEBUG] result_embd tensor shape: [%ld, %ld, %ld, %ld]\n",
+        (long)cur->ne[0], (long)cur->ne[1], (long)cur->ne[2], (long)cur->ne[3]);
 
     cb(cur, "result_embd", -1);
     res->t_embd = cur;

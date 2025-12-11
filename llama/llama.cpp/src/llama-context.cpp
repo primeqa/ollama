@@ -905,6 +905,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
         GGML_ASSERT(backend_embd != nullptr);
 
+        // DEBUG: Log embedding extraction
+        LLAMA_LOG_INFO("[EMBED DEBUG] pooling_type=%d n_tokens=%d n_embd=%d t_embd.ne=[%ld,%ld,%ld,%ld]\n",
+            (int)cparams.pooling_type, (int)n_tokens, (int)n_embd,
+            (long)t_embd->ne[0], (long)t_embd->ne[1], (long)t_embd->ne[2], (long)t_embd->ne[3]);
+
         switch (cparams.pooling_type) {
             case LLAMA_POOLING_TYPE_NONE:
                 {
@@ -913,6 +918,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
                     GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_size);
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd, 0, n_tokens*n_embd*sizeof(float));
+                    LLAMA_LOG_INFO("[EMBED DEBUG] POOLING_TYPE_NONE: extracted %d tokens\n", (int)n_tokens);
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
             case LLAMA_POOLING_TYPE_CLS:
@@ -921,12 +927,29 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     // extract sequence embeddings
                     auto & embd_seq_out = embd_seq;
 
+                    LLAMA_LOG_INFO("[EMBED DEBUG] POOLING_TYPE=%s: extracting %d sequences\n",
+                        cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ? "MEAN" :
+                        cparams.pooling_type == LLAMA_POOLING_TYPE_CLS ? "CLS" : "LAST",
+                        (int)ubatch.n_seqs_unq);
+
                     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                         const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
+                        LLAMA_LOG_INFO("[EMBED DEBUG]   seq %d: seq_id=%d seq_idx=%d offset=%d bytes\n",
+                            s, (int)seq_id, (int)seq_idx, (int)((n_embd*seq_idx)*sizeof(float)));
+
                         embd_seq_out[seq_id].resize(n_embd);
                         ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
+
+                        // DEBUG: Print first 10 values after extraction
+                        // Need to synchronize first to ensure data is ready
+                        ggml_backend_synchronize(backend_embd);
+                        LLAMA_LOG_INFO("[EMBED DEBUG]   First 10 values: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
+                            embd_seq_out[seq_id][0], embd_seq_out[seq_id][1], embd_seq_out[seq_id][2],
+                            embd_seq_out[seq_id][3], embd_seq_out[seq_id][4], embd_seq_out[seq_id][5],
+                            embd_seq_out[seq_id][6], embd_seq_out[seq_id][7], embd_seq_out[seq_id][8],
+                            embd_seq_out[seq_id][9]);
                     }
                 } break;
             case LLAMA_POOLING_TYPE_RANK:

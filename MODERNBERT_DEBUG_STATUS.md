@@ -645,3 +645,158 @@ python3 scripts/debug_tiny_layers.py
 - The 0.999 similarity with Token 3 means all layers, FFN, attention, normalization are working perfectly
 - The current issue is likely a red herring or artifact of the rebuild process
 - Should focus on understanding why the rebuild changed the output, not on implementing new features
+
+---
+
+## Session 3: Pooling Type Bug Discovery and Row Index Investigation
+**Date**: 2025-12-10 (continued)
+
+### Critical Bug Found: Wrong Pooling Type Enum Value
+
+**Location**: `convert/convert_modernbert.go:76`
+
+**Bug**: Mean pooling was incorrectly set to type 3 instead of type 1
+```go
+// WRONG:
+if p.ClassifierPooling == "mean" {
+    p.PoolingType = 3 // Mean pooling - INCORRECT!
+}
+
+// CORRECT:
+if p.ClassifierPooling == "mean" {
+    p.PoolingType = 1 // Mean pooling
+}
+```
+
+**Pooling Type Enum** (from `llama.h:169-174`):
+- `0` = LLAMA_POOLING_TYPE_NONE
+- `1` = LLAMA_POOLING_TYPE_MEAN
+- `2` = LLAMA_POOLING_TYPE_CLS
+- `3` = LLAMA_POOLING_TYPE_LAST
+- `4` = LLAMA_POOLING_TYPE_RANK
+
+**Impact**: This bug caused all models with `classifier_pooling: "cls"` (which falls through to the else branch due to no modules.json) to use LAST pooling instead of CLS pooling.
+
+### Test Results with Tiny-ModernBERT (2-layer, 256-dim model)
+
+**Test Setup**:
+- Model: `/tmp/tiny-modernbert` (custom 2-layer ModernBERT)
+- Test input: "Hello world" (4 tokens: [CLS] Hello world [SEP])
+- HuggingFace embeddings for reference:
+  - Token 0 (CLS): `[-1.8017, 0.9383, 0.6363, 1.4142, 1.2467]`, norm=15.999917
+  - Token 1: `[1.3028, 0.6296, -0.8964, -0.8969, -0.2321]`, norm=15.999916
+  - Token 2: `[0.5002, 0.3877, 0.9828, 1.3630, 0.5307]`, norm=15.999915
+  - Token 3 (EOS): `[-1.1995, 0.5326, -1.9458, 0.4393, -0.2315]`, norm=15.999918
+
+#### Result 1: LAST Pooling (type=3) - PERFECT ✅
+```
+Ollama embedding: [-1.2371, 0.5365, -1.9475, 0.4664, -0.2728, ...]
+HF Token 3:       [-1.1995, 0.5326, -1.9458, 0.4393, -0.2315, ...]
+Cosine similarity: 0.999512
+```
+**Conclusion**: LAST pooling works perfectly! Model computation is 100% correct.
+
+#### Result 2: CLS Pooling (type=2, row=0) - WRONG ❌
+```
+Ollama embedding: [0.0015, -1.4584, 0.2492, 1.8995, -1.1554, ...]
+HF Token 0:       [-1.8017, 0.9383, 0.6363, 1.4142, 1.2467, ...]
+HF Token 3:       [-1.1995, 0.5326, -1.9458, 0.4393, -0.2315, ...]
+Cosine similarity with Token 0: 0.063226
+Cosine similarity with Token 3: -0.063856
+```
+**Observation**: Values don't match ANY token exactly! Very different from the 0.999 we got with LAST pooling.
+
+#### Result 3: CLS Pooling with Forced row=1 - APPROXIMATE ⚠️
+```
+Ollama embedding: [1.1475, 1.3699, 1.0200, -1.1429, -0.2197]
+HF Token 1:       [1.3028, 0.6296, -0.8964, -0.8969, -0.2321]
+```
+**Observation**: Values are CLOSE to Token 1 but not exact (unlike the 0.999 match with LAST pooling).
+
+### Key Findings
+
+1. **LAST pooling (type=3) works perfectly** - Returns Token 3 with 0.999 similarity ✅
+2. **CLS pooling (type=2) returns wrong data** - Even when row index is correct ❌
+3. **Row index selection logic is correct** - Debug logs show `row=0, pos=0` for CLS
+4. **The issue is in data extraction, not selection** - `ggml_get_rows` appears to extract different data for non-LAST pooling types
+
+### Tensor Shape Analysis
+
+**Before pooling** (`result_embd`):
+- Shape: `[256, 4, 1, 1]` (256 embedding dims, 4 tokens)
+- Strides: `nb[0]=4, nb[1]=1024, nb[2]=4096, nb[3]=4096` bytes
+- Token layout:
+  - Token 0: offset 0
+  - Token 1: offset 1024
+  - Token 2: offset 2048
+  - Token 3: offset 3072
+
+**After pooling** (`result_embd_pooled`):
+- Shape: `[256, 1, 1, 1]` (single embedding vector)
+- Created via: `ggml_get_rows(ctx0, inp, inp_cls)` where `inp_cls` contains row index
+
+### Debug Logs
+```
+[POOLING DEBUG] arch=MODERNBERT pooling_type=2 last=0 n_tokens=4
+[POOLING DEBUG]   token[0]: pos=0
+[POOLING DEBUG]   token[1]: pos=1
+[POOLING DEBUG]   token[2]: pos=2
+[POOLING DEBUG]   token[3]: pos=3
+[POOLING DEBUG] Selected token row=0 pos=0
+[POOLING GRAPH DEBUG] inp tensor shape: [256, 4, 1, 1]
+[POOLING GRAPH DEBUG] CLS pooling: inp_cls.ne=[1, 1, 1, 1] inp.nb=[4, 1024, 4096, 4096]
+[EMBED DEBUG] pooling_type=2 n_tokens=4 n_embd=256 t_embd.ne=[256,1,1,1]
+[EMBED DEBUG] POOLING_TYPE=CLS: extracting 1 sequences
+[EMBED DEBUG]   seq 0: seq_id=0 seq_idx=0 offset=0 bytes
+[EMBED DEBUG]   First 10 values: [0.0015, -1.4584, 0.2492, 1.8995, -1.1554, 0.8079, -1.8064, 0.9069, 1.4153, -0.1816]
+```
+
+### Hypothesis
+
+**The issue appears to be specific to how `ggml_get_rows` extracts data for ModernBERT's tensor layout when pooling_type != LAST.**
+
+Evidence:
+1. LAST pooling extracts perfectly (0.999 similarity)
+2. CLS pooling with any row index extracts approximate but not exact values
+3. The pooling selection logic correctly identifies row 0
+4. The tensor strides are correct (verified: Token 0 at offset 0, Token 1 at offset 1024, etc.)
+
+**Possible causes**:
+- `ggml_get_rows` may handle BERT-style tensors differently than decoder-style tensors
+- There may be a transpose or layout issue specific to encoder models
+- The extraction code path differs between NONE/LAST vs CLS/MEAN pooling types
+- Some intermediate operation between pooling and extraction modifies the data
+
+### Next Steps
+
+1. **Compare extraction codepaths**:
+   - Trace what happens after `build_pooling()` for different pooling types
+   - Check if there's normalization or other ops applied only to non-LAST pooling
+
+2. **Investigate `ggml_get_rows` implementation**:
+   - Find the compute kernel that implements GET_ROWS
+   - Check how it calculates offsets for multi-dimensional tensors
+   - Verify it works correctly for BERT-style `[embd_dim, n_tokens, 1, 1]` layout
+
+3. **Test with pooling_type=0 (NONE)**:
+   - Earlier tests showed NONE also returned Token 3
+   - Need to understand why NONE and non-LAST pooling behave differently
+
+4. **Check if issue is ModernBERT-specific**:
+   - Test with standard BERT model
+   - Compare with NomicBERT (which works correctly)
+
+### Files Modified
+
+- `convert/convert_modernbert.go:76` - Fixed MEAN pooling type (3 → 1)
+- `llama/llama.cpp/src/llama-graph.cpp:189-263` - Added extensive debug logging for pooling
+- `llama/llama.cpp/src/llama-graph.cpp:1983-2007` - Added tensor shape/stride logging
+- `llama/llama.cpp/src/llama-context.cpp:904-953` - Added embedding extraction debug logs
+- `llama/llama.cpp/src/models/bert.cpp:2,260-261` - Added debug logging
+
+### Test Scripts Created
+
+- `scripts/check_permutation.py` - Check if embedding is permuted/shifted
+- `scripts/find_index_pattern.py` - Analyze index mapping between Ollama and HF
+- `scripts/test_cls_pooling.py` - Compare CLS pooling output with HF tokens
+

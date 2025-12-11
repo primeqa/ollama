@@ -241,11 +241,19 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 
         for (int s = 0; s < n_seqs_unq; ++s) {
             if (target_row[s] >= 0) {
-                data[s] = target_row[s];
+                // DEBUG: Force different row indices to test
+                if (arch == LLM_ARCH_MODERNBERT && !last) {
+                    // Force row 1 instead of row 0
+                    LLAMA_LOG_INFO("[POOLING DEBUG] TESTING: Forcing row=1 (target was %d)\n", target_row[s]);
+                    data[s] = 1;
+                } else {
+                    data[s] = target_row[s];
+                }
 
                 // DEBUG: Log final selection
                 if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
-                    LLAMA_LOG_INFO("[POOLING DEBUG] Selected token row=%d pos=%d\n", target_row[s], target_pos[s]);
+                    LLAMA_LOG_INFO("[POOLING DEBUG] Selected token row=%d pos=%d (stored row=%d)\n",
+                        target_row[s], target_pos[s], data[s]);
                 }
             }
         }
@@ -1979,6 +1987,10 @@ void llm_graph_context::build_pooling(
 
     ggml_tensor * cur;
 
+    // DEBUG: Log input tensor shape
+    LLAMA_LOG_INFO("[POOLING GRAPH DEBUG] inp tensor shape: [%ld, %ld, %ld, %ld]\n",
+        (long)inp->ne[0], (long)inp->ne[1], (long)inp->ne[2], (long)inp->ne[3]);
+
     switch (pooling_type) {
         case LLAMA_POOLING_TYPE_NONE:
             {
@@ -1993,7 +2005,13 @@ void llm_graph_context::build_pooling(
         case LLAMA_POOLING_TYPE_LAST:
             {
                 ggml_tensor * inp_cls = build_inp_cls();
+                LLAMA_LOG_INFO("[POOLING GRAPH DEBUG] CLS pooling: inp_cls.ne=[%ld, %ld, %ld, %ld] inp.nb=[%zu, %zu, %zu, %zu]\n",
+                    (long)inp_cls->ne[0], (long)inp_cls->ne[1], (long)inp_cls->ne[2], (long)inp_cls->ne[3],
+                    inp->nb[0], inp->nb[1], inp->nb[2], inp->nb[3]);
                 cur = ggml_get_rows(ctx0, inp, inp_cls);
+                LLAMA_LOG_INFO("[POOLING GRAPH DEBUG] After get_rows: cur.ne=[%ld, %ld, %ld, %ld] cur.nb=[%zu, %zu, %zu, %zu]\n",
+                    (long)cur->ne[0], (long)cur->ne[1], (long)cur->ne[2], (long)cur->ne[3],
+                    cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
             } break;
         case LLAMA_POOLING_TYPE_RANK:
             {
