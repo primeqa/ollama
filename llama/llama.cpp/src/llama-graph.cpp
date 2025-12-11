@@ -209,8 +209,20 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
             (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && arch == LLM_ARCH_QWEN3) // qwen3 reranking & embedding models use last token
         );
 
+        // DEBUG: Log pooling behavior
+        if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
+            LLAMA_LOG_INFO("[POOLING DEBUG] arch=%s pooling_type=%d last=%d n_tokens=%d\n",
+                arch == LLM_ARCH_MODERNBERT ? "MODERNBERT" : "BERT",
+                cparams.pooling_type, last, (int)n_tokens);
+        }
+
         for (int i = 0; i < n_tokens; ++i) {
             const llama_pos pos = ubatch->pos[i];
+
+            // DEBUG: Log token positions for BERT/ModernBERT
+            if ((arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) && n_seqs_unq == 1) {
+                LLAMA_LOG_INFO("[POOLING DEBUG]   token[%d]: pos=%d\n", i, (int)pos);
+            }
 
             for (int s = 0; s < ubatch->n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id  = ubatch->seq_id[i][s];
@@ -230,6 +242,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
         for (int s = 0; s < n_seqs_unq; ++s) {
             if (target_row[s] >= 0) {
                 data[s] = target_row[s];
+
+                // DEBUG: Log final selection
+                if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
+                    LLAMA_LOG_INFO("[POOLING DEBUG] Selected token row=%d pos=%d\n", target_row[s], target_pos[s]);
+                }
             }
         }
     }

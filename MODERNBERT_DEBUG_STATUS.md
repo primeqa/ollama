@@ -399,3 +399,249 @@ kv["modernbert.rope.freq_base_global"] = 80000.0
 ## Conclusion
 
 The ModernBERT implementation in Ollama is structurally complete but functionally incorrect. All the major architectural components are implemented (GeGLU, alternating attention, CLS pooling, final norm), but the embeddings don't match the reference. The most likely cause is the missing sliding window attention implementation for local layers, which would significantly affect 14 out of 22 layers. This should be the next focus for debugging.
+
+---
+
+## UPDATE: Tiny-ModernBERT Debugging Session (2025-12-10 Evening)
+
+### Summary
+
+Created a minimal 2-layer ModernBERT model for easier debugging. Discovered critical pooling bug but encountered unexpected behavior after fixing it.
+
+### Test Model Details
+- **Model**: `/tmp/tiny-modernbert`
+- **Architecture**: ModernBERT with 2 layers (both global, no sliding window)
+- **Size**: 256 hidden, 512 intermediate, 4 heads
+- **Config**: `classifier_pooling: "cls"` (no `modules.json` file)
+
+### Key Discovery #1: Wrong Token Selection ✅
+
+**Problem Found**: Ollama was returning the **last token (EOS)** instead of the **CLS token (first token)**
+
+**Evidence**:
+```
+Comparing Ollama embedding with all HuggingFace tokens:
+  Token 0 (CLS) similarity: -0.123824  ❌
+  Token 1 similarity: -0.090535  ❌
+  Token 2 similarity: -0.057325  ❌
+  Token 3 (EOS) similarity: 0.999512  ✅ PERFECT MATCH!
+```
+
+**Conclusion**: The model computation was **100% correct**! The only issue was pooling selecting the wrong token.
+
+### Key Discovery #2: Pooling Type Was 0 (NONE) ✅
+
+**Root Cause**: Converter bug in `convert/convert_modernbert.go:40-46`
+
+**The Bug**:
+```go
+func (p *modernBertModel) parseMore(fsys fs.FS) error {
+    bts, err := fs.ReadFile(fsys, "modules.json")
+    if err != nil {
+        return nil  // ❌ RETURNS EARLY!
+    }
+    // Fallback logic to check classifier_pooling NEVER EXECUTES
+}
+```
+
+When `modules.json` doesn't exist (like in tiny-modernbert), the function returns early and never reaches the fallback logic that checks `classifier_pooling` from `config.json`. This resulted in `PoolingType = 0` (NONE) instead of `2` (CLS).
+
+**The Fix**:
+```go
+func (p *modernBertModel) parseMore(fsys fs.FS) error {
+    var hasPoolingModule bool
+    bts, err := fs.ReadFile(fsys, "modules.json")
+    if err == nil {  // ✅ Continue if modules.json doesn't exist
+        // Parse modules.json
+        ...
+    }
+    
+    // Always execute pooling type selection
+    if hasPoolingModule {
+        p.PoolingType = 2 // From modules.json
+    } else {
+        // ✅ Fallback to classifier_pooling from config.json
+        if p.ClassifierPooling == "mean" {
+            p.PoolingType = 1
+        } else if p.ClassifierPooling == "cls" {
+            p.PoolingType = 2
+        } else {
+            p.PoolingType = 2 // Default to CLS
+        }
+    }
+}
+```
+
+**File**: `convert/convert_modernbert.go:40-87`
+
+### Key Discovery #3: llama.cpp Pooling Logic Analysis ✅
+
+**File**: `llama/llama.cpp/src/llama-graph.cpp:189-253`
+
+The pooling logic in `llm_graph_input_cls::set_input()` is **correct**:
+
+```cpp
+const bool last = (
+     cparams.pooling_type == LLAMA_POOLING_TYPE_LAST ||
+    (cparams.pooling_type == LLAMA_POOLING_TYPE_RANK && arch == LLM_ARCH_QWEN3)
+);
+
+for (int i = 0; i < n_tokens; ++i) {
+    const llama_pos pos = ubatch->pos[i];
+    ...
+    if (
+        (target_pos[seq_idx] == -1) ||
+        ( last && pos >= target_pos[seq_idx]) ||  // LAST: pick highest position
+        (!last && pos <  target_pos[seq_idx])      // CLS: pick lowest position
+    ) {
+        target_pos[seq_idx] = pos;
+        target_row[seq_idx] = i;
+    }
+}
+```
+
+- For `LLAMA_POOLING_TYPE_CLS` (2): Selects token with **lowest position** (first token)
+- For `LLAMA_POOLING_TYPE_LAST` (3): Selects token with **highest position** (last token)
+
+**Note**: As explained by user, `POOLING_TYPE_CLS` and `POOLING_TYPE_LAST` use the same code path because llama.cpp was designed for decoder models (Llama/Mistral) that don't have dedicated CLS tokens. For encoder models like BERT/ModernBERT, the position-based logic correctly differentiates them.
+
+### Unexpected Issue ❌
+
+After fixing the pooling bug and rebuilding:
+
+**Before Fix** (pooling_type=0):
+- Model correctly computed all tokens
+- Returned Token 3 (wrong token, but correct computation)
+- Token 3 similarity: **0.999512** ✅
+
+**After Fix** (pooling_type=2):
+- Model returns different embeddings
+- No token matches HuggingFace:
+  - Token 0 (CLS): 0.063226
+  - Token 1: -0.075126
+  - Token 2: 0.079417
+  - Token 3 (EOS): -0.063856
+- Mean pooling: 0.001965
+
+**Comparison**:
+```
+Before (pooling=0):
+  Ollama: [-1.2371017   0.53650194 -1.9475449 ...]
+  Matched Token 3 with 0.999 similarity
+
+After (pooling=2):
+  Ollama: [ 1.5276266e-03 -1.4584416e+00  2.4915619e-01 ...]
+  Doesn't match ANY token
+```
+
+**Observations**:
+1. Norms are identical in both cases (~16.0)
+2. But the embedding values are completely different
+3. HuggingFace output is the same in both runs
+4. Only change was: rebuilt Go binary with pooling fix
+5. Native libs (cmake) were NOT rebuilt
+6. Model blob is different (different sha256)
+
+### Debug Additions
+
+Added debug logging to `llama/llama.cpp/src/llama-graph.cpp:212-249`:
+```cpp
+// DEBUG: Log pooling behavior
+if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
+    LLAMA_LOG_INFO("[POOLING DEBUG] arch=%s pooling_type=%d last=%d n_tokens=%d\n",
+        arch == LLM_ARCH_MODERNBERT ? "MODERNBERT" : "BERT",
+        cparams.pooling_type, last, (int)n_tokens);
+}
+```
+
+**Note**: Debug logs didn't print, suggesting `cparams.embeddings` might be false or pooling isn't being triggered.
+
+### Current Status
+
+✅ **Fixed Issues**:
+1. Converter now reads `classifier_pooling` from `config.json` when `modules.json` is missing
+2. `pooling_type` is now correctly set to 2 (CLS) for tiny-modernbert
+3. Identified that model computation was correct all along (proven by 0.999 similarity with Token 3)
+
+❌ **Remaining Issues**:
+1. After fixing pooling_type, embeddings changed completely
+2. No token matches HuggingFace anymore (all similarities ~0.06-0.08)
+3. Something about the model conversion or inference changed between rebuilds
+4. Unclear why pooling_type affects the actual embedding values (not just which token is selected)
+
+### Hypotheses for Investigation
+
+1. **Hypothesis #1: Model conversion changed**
+   - Maybe different weights were loaded due to some change in conversion
+   - Could verify by comparing GGUF tensors between the two model blobs
+
+2. **Hypothesis #2: Pooling affects forward pass**
+   - Maybe llama.cpp does something different during forward pass based on pooling_type
+   - Could check if embeddings mode changes computation
+
+3. **Hypothesis #3: Wrong embedding extraction**
+   - Maybe with pooling_type=2, we're getting a different intermediate output
+   - Could add more debug logging to see what's being returned
+
+4. **Hypothesis #4: Cache issue**
+   - Maybe old binary or libs are being used
+   - Could do clean rebuild: `go clean -cache && cmake --build build --clean-first`
+
+### Files Modified in This Session
+
+1. **`convert/convert_modernbert.go`** (lines 40-87)
+   - Fixed early return when `modules.json` doesn't exist
+   - Added proper fallback to `classifier_pooling` config
+
+2. **`llama/llama.cpp/src/llama-graph.cpp`** (lines 212-249)
+   - Added debug logging for BERT/ModernBERT pooling
+
+3. **`scripts/test_tiny_modernbert.py`** (new file)
+   - Script to test tiny-modernbert embeddings against HuggingFace
+
+4. **`scripts/debug_tiny_layers.py`** (new file)
+   - Script to compare Ollama embedding with all HuggingFace tokens
+
+### Test Commands
+
+```bash
+# Create tiny-modernbert model
+OLLAMA_HOST=127.0.0.1:11434 ./ollama create tiny-modernbert -f /tmp/Modelfile.tiny
+
+# Test embedding similarity
+source /home/raduf/miniforge3/etc/profile.d/conda.sh
+conda activate docu
+python3 scripts/test_tiny_modernbert.py
+
+# Debug token-by-token comparison
+python3 scripts/debug_tiny_layers.py
+```
+
+### Next Steps
+
+1. **Investigate why embeddings changed after pooling fix**
+   - Compare GGUF model blobs before/after
+   - Check if pooling_type affects forward pass
+   - Verify correct binary is being used
+
+2. **Add more detailed debugging**
+   - Dump intermediate layer outputs from both Ollama and HuggingFace
+   - Compare layer-by-layer to find where divergence occurs
+   - Add logging to see actual token indices being selected
+
+3. **Try clean rebuild**
+   - `go clean -cache`
+   - `cmake --build build --clean-first`
+   - Recreate model and test again
+
+4. **Verify tensor loading**
+   - Check if GGUF tensors match SafeTensors
+   - Verify no transposition issues
+   - Check FFN gate/up split is correct
+
+### Important Notes
+
+- The original issue (returning Token 3 instead of Token 0) proved that **model computation is 100% correct**
+- The 0.999 similarity with Token 3 means all layers, FFN, attention, normalization are working perfectly
+- The current issue is likely a red herring or artifact of the rebuild process
+- Should focus on understanding why the rebuild changed the output, not on implementing new features

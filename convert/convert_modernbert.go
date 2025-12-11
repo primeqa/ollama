@@ -39,45 +39,47 @@ var (
 
 func (p *modernBertModel) parseMore(fsys fs.FS) error {
 	// Parse sentence_transformers module config if present
-	bts, err := fs.ReadFile(fsys, "modules.json")
-	if err != nil {
-		// Not all models have this, return nil if missing
-		return nil
-	}
-
-	var modules []struct {
-		Type string `json:"type"`
-		Path string `json:"path"`
-	}
-
-	if err := json.Unmarshal(bts, &modules); err != nil {
-		return err
-	}
-
 	var hasPoolingModule bool
-	for _, m := range modules {
-		switch m.Type {
-		case "sentence_transformers.models.Pooling":
-			hasPoolingModule = true
-		case "sentence_transformers.models.Normalize":
-			p.normalizeEmbeddings = true
+	bts, err := fs.ReadFile(fsys, "modules.json")
+	if err == nil {
+		// modules.json exists, parse it
+		var modules []struct {
+			Type string `json:"type"`
+			Path string `json:"path"`
+		}
+
+		if err := json.Unmarshal(bts, &modules); err != nil {
+			return err
+		}
+
+		for _, m := range modules {
+			switch m.Type {
+			case "sentence_transformers.models.Pooling":
+				hasPoolingModule = true
+			case "sentence_transformers.models.Normalize":
+				p.normalizeEmbeddings = true
+			}
 		}
 	}
 
-	// ModernBERT embedding models use CLS pooling (first token)
-	// The modules.json indicates this is a sentence-transformers model with a Pooling module
-	// These embedding models should use CLS token pooling, not the classifier_pooling setting
-	// (classifier_pooling is for classification heads, not embeddings)
+	// Set pooling type based on available information
+	// Priority: modules.json Pooling module > classifier_pooling config
 	if hasPoolingModule {
+		// ModernBERT embedding models use CLS pooling (first token)
+		// The modules.json indicates this is a sentence-transformers model with a Pooling module
 		slog.Debug("modernbert: detected sentence-transformers Pooling module, using CLS pooling")
 		p.PoolingType = 2 // CLS pooling for embedding models
 	} else {
-		// No pooling module - fall back to classifier_pooling setting
+		// No pooling module - fall back to classifier_pooling setting from config.json
 		slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling)
 		if p.ClassifierPooling == "mean" {
 			p.PoolingType = 1 // Mean pooling
+		} else if p.ClassifierPooling == "cls" {
+			p.PoolingType = 2 // CLS pooling
 		} else {
-			p.PoolingType = 2 // CLS pooling (default)
+			// Default to CLS pooling for ModernBERT
+			slog.Warn("modernbert: unknown classifier_pooling value, defaulting to CLS", "value", p.ClassifierPooling)
+			p.PoolingType = 2
 		}
 	}
 
