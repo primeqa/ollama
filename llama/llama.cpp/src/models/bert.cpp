@@ -128,9 +128,10 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            // Note: ModernBERT's sliding window attention for local layers is not yet implemented
-            // Current implementation uses full attention on all layers, with alternating RoPE theta
-            // TODO: Implement bidirectional sliding window masking for local attention layers
+            // ModernBERT: Sliding window attention is automatically applied to local layers
+            // Global layers (il % global_attn_every_n_layers == 0) use full attention
+            // Local layers use bidirectional sliding window attention (SYMMETRIC)
+            // The build_attn function selects the appropriate mask based on hparams.is_swa(il)
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].bo,

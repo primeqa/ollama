@@ -934,6 +934,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_LOCAL,  hparams.rope_freq_base_local,  10000.0f);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
 
+                // Set up sliding window attention for local layers
+                if (hparams.global_attn_every_n_layers > 0 && hparams.local_attn_window > 0) {
+                    hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;  // bidirectional SWA for encoder
+                    hparams.n_swa = hparams.local_attn_window;
+                    hparams.set_swa_pattern(hparams.global_attn_every_n_layers, true);  // dense_first = true
+                } else {
+                    hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+                }
+
                 if (hparams.n_layer == 22 && hparams.n_embd == 768) {
                     type = LLM_TYPE_149M; // granite-embedding-english-r2
                 }
