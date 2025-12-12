@@ -292,3 +292,79 @@ EOF
 - Verify skip logic in `Tensors()` matches the model's actual structure
 - Add debug logging: `slog.Debug("skipping tensor", "name", name, "layer", layer)`
 - Compare expected count from error message with actual model architecture
+
+### Tokenizer Configuration (Critical)
+
+ModernBERT uses a GPT2/BPE tokenizer (like RoBERTa), NOT a BERT WordPiece tokenizer. The following settings are required in `convert/convert_modernbert.go`:
+
+```go
+// Tokenizer model type - MUST be "gpt2", not "bert"
+kv["tokenizer.ggml.model"] = "gpt2"
+kv["tokenizer.ggml.token_type_count"] = uint32(2)
+
+// BOS/EOS map to CLS/SEP for BERT-like models
+kv["tokenizer.ggml.bos_token_id"] = uint32(50281)  // CLS token
+kv["tokenizer.ggml.eos_token_id"] = uint32(50282)  // SEP token
+kv["tokenizer.ggml.add_bos_token"] = true
+kv["tokenizer.ggml.add_eos_token"] = true
+```
+
+**Key lessons learned:**
+1. `norm_eps` field in config.json (not `layer_norm_eps`) - check JSON struct tags match actual config
+2. Don't override `kv["tokenizer.ggml.tokens"]` - the base `ModelParameters.KV(t)` handles it correctly
+3. llama.cpp uses BOS/EOS terminology but for BERT it maps to CLS/SEP tokens
+4. Token IDs must match HuggingFace exactly - wrong tokenizer type produces wrong IDs
+
+**Debugging tokenizer issues:**
+```bash
+# Check GGUF tokenizer metadata
+python3 -c "
+from gguf import GGUFReader
+reader = GGUFReader('/path/to/model.gguf')
+for field in reader.fields.values():
+    if 'token' in field.name.lower():
+        print(f'{field.name}: {field.parts[-1] if field.parts else \"N/A\"}')"
+```
+
+### Final Working KV Configuration
+
+```go
+func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
+    kv := p.ModelParameters.KV(t)
+
+    kv["general.architecture"] = "modernbert"
+    kv["modernbert.attention.causal"] = false
+    kv["modernbert.pooling_type"] = p.PoolingType  // 2 for CLS pooling
+    kv["modernbert.normalize_embeddings"] = p.normalizeEmbeddings
+    kv["modernbert.block_count"] = p.NumHiddenLayers
+    kv["modernbert.context_length"] = p.MaxPositionEmbeddings
+    kv["modernbert.embedding_length"] = p.HiddenSize
+    kv["modernbert.feed_forward_length"] = p.IntermediateSize
+    kv["modernbert.attention.head_count"] = p.NumAttentionHeads
+    kv["modernbert.attention.layer_norm_epsilon"] = p.LayerNormEPS  // From "norm_eps" in config.json
+    kv["modernbert.attention.global_attn_every_n_layers"] = cmp.Or(p.GlobalAttnEveryNLayers, 3)
+    kv["modernbert.attention.local_attn_window"] = cmp.Or(p.LocalAttention, 128)
+    kv["modernbert.rope.freq_base_local"] = cmp.Or(p.LocalRopeTheta, 10000.0)
+    kv["modernbert.rope.freq_base_global"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
+
+    // Tokenizer - GPT2/BPE, not BERT WordPiece
+    kv["tokenizer.ggml.model"] = "gpt2"
+    kv["tokenizer.ggml.token_type_count"] = uint32(2)
+    kv["tokenizer.ggml.bos_token_id"] = uint32(50281)  // CLS
+    kv["tokenizer.ggml.eos_token_id"] = uint32(50282)  // SEP
+    kv["tokenizer.ggml.add_bos_token"] = true
+    kv["tokenizer.ggml.add_eos_token"] = true
+
+    return kv
+}
+```
+
+### Verifying Embeddings Match HuggingFace
+
+Use `scripts/debug/compare_element_by_element.py` to verify embeddings:
+```bash
+python3 scripts/debug/compare_element_by_element.py
+# Expected output: Token 0 correlation = 1.000000
+```
+
+The script compares Ollama's CLS token embedding against HuggingFace's normalized output.
