@@ -55,6 +55,15 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
     // construct input embeddings (token, type, position)
     inpL = build_inp_embd(model.tok_embd);
+    cb(inpL, "tok_embd_lookup", -1);  // Track embedding lookup result
+
+    // DEBUG: Check tok_embd weights for ModernBERT
+    if (model.arch == LLM_ARCH_MODERNBERT && model.tok_embd) {
+        LLAMA_LOG_INFO("[DEBUG] tok_embd shape: [%ld, %ld]\n",
+            model.tok_embd->ne[0], model.tok_embd->ne[1]);
+        // Note: Can't easily print weight values here as they might not be in host memory
+        // We'll check the output embeddings instead
+    }
 
     // token types are hardcoded to zero ("Sentence A")
     if (model.type_embd) {
@@ -66,10 +75,20 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     }
     cb(inpL, "inp_embd", -1);
 
+    // DEBUG: Log embedding tensor shapes
+    if (model.arch == LLM_ARCH_MODERNBERT) {
+        LLAMA_LOG_INFO("[MODERNBERT DEBUG] inp_embd shape: [%lld, %lld, %lld, %lld]\n",
+            (long long)inpL->ne[0], (long long)inpL->ne[1],
+            (long long)inpL->ne[2], (long long)inpL->ne[3]);
+        if (model.tok_embd) {
+            LLAMA_LOG_INFO("[MODERNBERT DEBUG] tok_embd weight shape: [%lld, %lld]\n",
+                (long long)model.tok_embd->ne[0], (long long)model.tok_embd->ne[1]);
+        }
+    }
+
     // embed layer norm
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
     cb(inpL, "inp_norm", -1);
-    dump_tensor_to_file("inp_norm", inpL, -1);
 
     auto * inp_attn = build_attn_inp_no_cache();
 

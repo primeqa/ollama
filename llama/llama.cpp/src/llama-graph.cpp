@@ -241,19 +241,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 
         for (int s = 0; s < n_seqs_unq; ++s) {
             if (target_row[s] >= 0) {
-                // DEBUG: Force different row indices to test
-                if (arch == LLM_ARCH_MODERNBERT && !last) {
-                    // Force row 1 instead of row 0
-                    LLAMA_LOG_INFO("[POOLING DEBUG] TESTING: Forcing row=1 (target was %d)\n", target_row[s]);
-                    data[s] = 1;
-                } else {
-                    data[s] = target_row[s];
-                }
+                data[s] = target_row[s];
 
                 // DEBUG: Log final selection
                 if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
-                    LLAMA_LOG_INFO("[POOLING DEBUG] Selected token row=%d pos=%d (stored row=%d)\n",
-                        target_row[s], target_pos[s], data[s]);
+                    LLAMA_LOG_INFO("[POOLING DEBUG] Selected token row=%d pos=%d\n", target_row[s], target_pos[s]);
                 }
             }
         }
@@ -325,6 +317,11 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     const int64_t n_kv     = ubatch->n_tokens;
     const int64_t n_tokens = ubatch->n_tokens;
 
+    // DEBUG: Log causal_attn value when setting attention mask
+    LLAMA_LOG_INFO("[MASK DEBUG] set_input called: n_tokens=%lld, causal_attn=%d\n",
+        (long long)n_tokens, (int)cparams.causal_attn);
+    const bool debug_mask = true;  // Force mask debug output
+
     const auto fill_mask = [&](float * data, int n_swa, llama_swa_type swa_type) {
         for (int h = 0; h < 1; ++h) {
             for (int i1 = 0; i1 < n_tokens; ++i1) {
@@ -367,6 +364,24 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         std::fill(data, data + ggml_nelements(self_kq_mask), -INFINITY);
 
         fill_mask(data, 0, LLAMA_SWA_TYPE_NONE);
+
+        // DEBUG: Print the actual mask values
+        if (debug_mask && n_tokens <= 10) {
+            LLAMA_LOG_INFO("[MASK DEBUG] Attention mask (0=attend, -inf=masked):\n");
+            LLAMA_LOG_INFO("     ");
+            for (int j = 0; j < n_tokens; ++j) {
+                LLAMA_LOG_INFO(" %2d", j);
+            }
+            LLAMA_LOG_INFO("\n");
+            for (int i = 0; i < n_tokens; ++i) {
+                LLAMA_LOG_INFO("  %2d ", i);
+                for (int j = 0; j < n_tokens; ++j) {
+                    float val = data[i * n_kv + j];
+                    LLAMA_LOG_INFO(" %s", (val == -INFINITY) ? " X" : " 0");
+                }
+                LLAMA_LOG_INFO("\n");
+            }
+        }
 
         if (debug) {
             print_mask(data, n_tokens, n_kv, 0, LLAMA_SWA_TYPE_NONE);
@@ -2005,13 +2020,20 @@ void llm_graph_context::build_pooling(
         case LLAMA_POOLING_TYPE_LAST:
             {
                 ggml_tensor * inp_cls = build_inp_cls();
-                LLAMA_LOG_INFO("[POOLING GRAPH DEBUG] CLS pooling: inp_cls.ne=[%ld, %ld, %ld, %ld] inp.nb=[%zu, %zu, %zu, %zu]\n",
-                    (long)inp_cls->ne[0], (long)inp_cls->ne[1], (long)inp_cls->ne[2], (long)inp_cls->ne[3],
-                    inp->nb[0], inp->nb[1], inp->nb[2], inp->nb[3]);
+                // DEBUG: Log tensor shapes for CLS/LAST pooling
+                if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
+                    LLAMA_LOG_INFO("[POOLING CLS DEBUG] inp shape: [%lld, %lld, %lld, %lld]\n",
+                        (long long)inp->ne[0], (long long)inp->ne[1],
+                        (long long)inp->ne[2], (long long)inp->ne[3]);
+                    LLAMA_LOG_INFO("[POOLING CLS DEBUG] inp_cls shape: [%lld]\n",
+                        (long long)inp_cls->ne[0]);
+                }
                 cur = ggml_get_rows(ctx0, inp, inp_cls);
-                LLAMA_LOG_INFO("[POOLING GRAPH DEBUG] After get_rows: cur.ne=[%ld, %ld, %ld, %ld] cur.nb=[%zu, %zu, %zu, %zu]\n",
-                    (long)cur->ne[0], (long)cur->ne[1], (long)cur->ne[2], (long)cur->ne[3],
-                    cur->nb[0], cur->nb[1], cur->nb[2], cur->nb[3]);
+                if (arch == LLM_ARCH_MODERNBERT || arch == LLM_ARCH_BERT) {
+                    LLAMA_LOG_INFO("[POOLING CLS DEBUG] cur shape after get_rows: [%lld, %lld, %lld, %lld]\n",
+                        (long long)cur->ne[0], (long long)cur->ne[1],
+                        (long long)cur->ne[2], (long long)cur->ne[3]);
+                }
             } break;
         case LLAMA_POOLING_TYPE_RANK:
             {

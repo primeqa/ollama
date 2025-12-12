@@ -21,7 +21,7 @@ type modernBertModel struct {
 	HiddenSize                uint32  `json:"hidden_size"`
 	IntermediateSize          uint32  `json:"intermediate_size"`
 	NumAttentionHeads         uint32  `json:"num_attention_heads"`
-	LayerNormEPS              float32 `json:"layer_norm_eps"`
+	LayerNormEPS              float32 `json:"norm_eps"`
 	GlobalAttnEveryNLayers    uint32  `json:"global_attn_every_n_layers"`
 	LocalAttention            uint32  `json:"local_attention"`
 	LocalRopeTheta            float32 `json:"local_rope_theta"`
@@ -89,6 +89,14 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv := p.ModelParameters.KV(t)
 
+	// DEBUG: Log tokenizer info
+	slog.Info("ModernBERT KV called",
+		"t.Tokens_count", len(t.Tokens),
+		"t.Vocabulary.Tokens_count", len(t.Vocabulary.Tokens),
+		"merge_count", len(t.Merges),
+		"first_token", t.Tokens[0],
+		"last_token", t.Tokens[len(t.Tokens)-1])
+
 	kv["general.architecture"] = "modernbert"
 	kv["modernbert.attention.causal"] = false
 	kv["modernbert.pooling_type"] = p.PoolingType
@@ -107,21 +115,18 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv["modernbert.rope.freq_base_local"] = cmp.Or(p.LocalRopeTheta, 10000.0)
 	kv["modernbert.rope.freq_base_global"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
 
-	kv["tokenizer.ggml.model"] = "bert"
+	// ModernBERT uses GPT2/BPE tokenizer (like RoBERTa), not BERT WordPiece
+	kv["tokenizer.ggml.model"] = "gpt2"
 	kv["tokenizer.ggml.token_type_count"] = uint32(2)
 
-	// Convert to phantom space tokens (like BERT/NomicBERT)
-	for i, e := range t.Tokens {
-		if strings.HasPrefix(e, "[") && strings.HasSuffix(e, "]") {
-			// Keep special tokens as-is
-		} else if strings.HasPrefix(e, "##") {
-			t.Tokens[i] = e[2:]
-		} else {
-			t.Tokens[i] = "\u2581" + e
-		}
-	}
+	// Tokens are already set by ModelParameters.KV(t) - don't overwrite
 
-	kv["tokenizer.ggml.tokens"] = t.Tokens
+	// BERT-like models need CLS (as BOS) and SEP (as EOS) tokens added automatically
+	// llama.cpp uses add_bos_token and add_eos_token with bos_token_id and eos_token_id
+	kv["tokenizer.ggml.bos_token_id"] = uint32(50281) // CLS token
+	kv["tokenizer.ggml.eos_token_id"] = uint32(50282) // SEP token
+	kv["tokenizer.ggml.add_bos_token"] = true
+	kv["tokenizer.ggml.add_eos_token"] = true
 
 	return kv
 }
