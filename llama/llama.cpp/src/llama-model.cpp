@@ -936,9 +936,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
 
                 // Set up sliding window attention for local layers
                 if (hparams.global_attn_every_n_layers > 0 && hparams.local_attn_window > 0) {
-                    hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;  // bidirectional SWA for encoder
                     hparams.n_swa = hparams.local_attn_window;
                     hparams.set_swa_pattern(hparams.global_attn_every_n_layers, true);  // dense_first = true
+
+                    // Only enable SWA if there are actually layers that use it
+                    if (hparams.is_swa_any()) {
+                        hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;  // bidirectional SWA for encoder
+                    } else {
+                        hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+                    }
                 } else {
                     hparams.swa_type = LLAMA_SWA_TYPE_NONE;
                 }

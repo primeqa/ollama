@@ -33,6 +33,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     // embed layer norm
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
     cb(inpL, "inp_norm", -1);
+    cb(inpL, "DEBUG_embeddings", -1);  // DEBUG: Track embeddings
 
     auto * inp_attn = build_attn_inp_no_cache();
 
@@ -211,6 +212,13 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
         // input for next layer
         inpL = cur;
+
+        // DEBUG: Track layer output
+        {
+            char debug_name[64];
+            snprintf(debug_name, sizeof(debug_name), "DEBUG_layer_%d", il);
+            cb(inpL, debug_name, il);
+        }
     }
 
     cur = inpL;
@@ -219,6 +227,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     if (model.arch == LLM_ARCH_MODERNBERT && model.output_norm) {
         cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
         cb(cur, "result_norm", -1);
+        cb(cur, "DEBUG_final_norm", -1);  // DEBUG: Track final norm output
     }
 
     cb(cur, "result_embd", -1);

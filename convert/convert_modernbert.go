@@ -107,6 +107,9 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv["modernbert.rope.freq_base_local"] = cmp.Or(p.LocalRopeTheta, 10000.0)
 	kv["modernbert.rope.freq_base_global"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
 
+	// Set general rope.freq_base to the global value (used as default by llama.cpp)
+	kv["general.rope.freq_base"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
+
 	// ModernBERT uses GPT2/BPE tokenizer (like RoBERTa), not BERT WordPiece
 	kv["tokenizer.ggml.model"] = "gpt2"
 	kv["tokenizer.ggml.token_type_count"] = uint32(2)
