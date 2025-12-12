@@ -645,3 +645,142 @@ python3 scripts/debug_tiny_layers.py
 - The 0.999 similarity with Token 3 means all layers, FFN, attention, normalization are working perfectly
 - The current issue is likely a red herring or artifact of the rebuild process
 - Should focus on understanding why the rebuild changed the output, not on implementing new features
+
+---
+
+## RESOLVED: Tokenizer Bugs Fixed (2025-12-11) ✅
+
+### Final Status: **WORKING** - Embeddings match HuggingFace with correlation = 1.0
+
+### Root Cause Analysis
+
+The embedding mismatch was caused by **multiple tokenizer configuration bugs** in the converter, not computation issues. The model computation was always correct (as proven by the 0.999 similarity with Token 3 when using wrong pooling).
+
+### Bugs Fixed
+
+#### Bug #1: Wrong `norm_eps` Field Name
+**File**: `convert/convert_modernbert.go:24`
+
+**Problem**: JSON field was `layer_norm_eps` but config.json uses `norm_eps`
+```go
+// Before (WRONG)
+LayerNormEPS float32 `json:"layer_norm_eps"`
+
+// After (CORRECT)
+LayerNormEPS float32 `json:"norm_eps"`
+```
+
+**Impact**: `norm_eps` was 0.0 instead of 1e-05, causing numerical issues in layer normalization.
+
+#### Bug #2: Wrong Tokenizer Model Type
+**File**: `convert/convert_modernbert.go:119`
+
+**Problem**: Was setting `tokenizer.ggml.model = "bert"` but ModernBERT uses GPT2/BPE tokenizer (like RoBERTa)
+```go
+// Before (WRONG)
+kv["tokenizer.ggml.model"] = "bert"
+
+// After (CORRECT)
+kv["tokenizer.ggml.model"] = "gpt2"
+```
+
+**Impact**: Tokens were being encoded incorrectly, producing wrong token IDs.
+
+#### Bug #3: Vocabulary Not Saved Correctly
+**File**: `convert/convert_modernbert.go` (removed line)
+
+**Problem**: Redundant `kv["tokenizer.ggml.tokens"] = t.Tokens` was corrupting the token array serialization. Only 10 tokens were being saved instead of 50368.
+
+**Solution**: Removed the redundant line. The base `ModelParameters.KV(t)` already handles token serialization correctly.
+
+#### Bug #4: Missing BOS/EOS Token IDs
+**File**: `convert/convert_modernbert.go:126-129`
+
+**Problem**: `bos_token_id` and `eos_token_id` weren't set, so llama.cpp used defaults (like 11) instead of the correct CLS (50281) and SEP (50282) tokens.
+
+```go
+// Added these lines
+kv["tokenizer.ggml.bos_token_id"] = uint32(50281) // CLS token
+kv["tokenizer.ggml.eos_token_id"] = uint32(50282) // SEP token
+kv["tokenizer.ggml.add_bos_token"] = true
+kv["tokenizer.ggml.add_eos_token"] = true
+```
+
+**Impact**: CLS and SEP tokens weren't being added to input, or wrong token IDs were used.
+
+### Verification
+
+**Before fixes** (wrong token IDs):
+```
+Token IDs: [101, 25521, 10186, 50282]  // Wrong!
+```
+
+**After fixes** (correct token IDs):
+```
+Token IDs: [50281, 12092, 1533, 50282]  // Correct!
+            CLS    Hello  world  SEP
+```
+
+**Embedding comparison**:
+```
+Token 0 (CLS) correlation: 1.000000  ✅ PERFECT MATCH
+```
+
+### Debug Code Cleanup
+
+Removed all debug logging added during investigation:
+
+**C++ files cleaned**:
+- `llama/llama.cpp/src/llama-graph.cpp`: Removed TOKEN DEBUG, POS DEBUG, POOLING DEBUG, MASK DEBUG
+- `llama/llama.cpp/src/llama-context.cpp`: Removed EXTRACT DEBUG
+- `llama/llama.cpp/src/models/bert.cpp`: Removed tok_embd DEBUG, inp_embd DEBUG, dump_tensor_to_file function
+
+**Go files cleaned**:
+- `convert/convert_modernbert.go`: Removed all verbose `slog.Info` debug statements
+
+### Final Working Configuration
+
+```go
+// convert/convert_modernbert.go KV() function
+kv["general.architecture"] = "modernbert"
+kv["modernbert.attention.causal"] = false
+kv["modernbert.pooling_type"] = p.PoolingType  // 2 for CLS
+kv["modernbert.normalize_embeddings"] = p.normalizeEmbeddings
+kv["modernbert.block_count"] = p.NumHiddenLayers
+kv["modernbert.context_length"] = p.MaxPositionEmbeddings
+kv["modernbert.embedding_length"] = p.HiddenSize
+kv["modernbert.feed_forward_length"] = p.IntermediateSize
+kv["modernbert.attention.head_count"] = p.NumAttentionHeads
+kv["modernbert.attention.layer_norm_epsilon"] = p.LayerNormEPS  // Must be read from "norm_eps"
+kv["modernbert.attention.global_attn_every_n_layers"] = cmp.Or(p.GlobalAttnEveryNLayers, 3)
+kv["modernbert.attention.local_attn_window"] = cmp.Or(p.LocalAttention, 128)
+kv["modernbert.rope.freq_base_local"] = cmp.Or(p.LocalRopeTheta, 10000.0)
+kv["modernbert.rope.freq_base_global"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
+
+// Tokenizer configuration
+kv["tokenizer.ggml.model"] = "gpt2"  // NOT "bert"!
+kv["tokenizer.ggml.token_type_count"] = uint32(2)
+kv["tokenizer.ggml.bos_token_id"] = uint32(50281)  // CLS token
+kv["tokenizer.ggml.eos_token_id"] = uint32(50282)  // SEP token
+kv["tokenizer.ggml.add_bos_token"] = true
+kv["tokenizer.ggml.add_eos_token"] = true
+```
+
+### Lessons Learned
+
+1. **Always verify tokenization first** - Wrong token IDs will produce wrong embeddings even if model computation is perfect
+2. **Check GGUF metadata** - Use `gguf.GGUFReader` to verify what's actually in the file
+3. **ModernBERT uses GPT2 tokenizer** - Despite being BERT-like, it uses BPE not WordPiece
+4. **BOS=CLS, EOS=SEP for BERT models** - llama.cpp uses BOS/EOS terminology but for BERT it maps to CLS/SEP
+5. **Debug logging is invaluable** - The token ID debug logging immediately revealed the problem
+
+### Test Scripts Created
+
+Located in `scripts/debug/`:
+- `check_gguf_tokens.py` - Verify GGUF tokenizer configuration
+- `compare_element_by_element.py` - Compare Ollama vs HuggingFace embeddings
+- `compare_layer_by_layer.py` - Compare intermediate layer outputs
+
+### Conclusion
+
+**ModernBERT implementation is now COMPLETE and WORKING.** The embeddings match HuggingFace perfectly (correlation = 1.0). All issues were in the tokenizer configuration, not the model computation. The model architecture (GeGLU FFN, alternating attention, RoPE, CLS pooling, final normalization) was correctly implemented from the start.

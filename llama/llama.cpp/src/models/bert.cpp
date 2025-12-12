@@ -1,43 +1,6 @@
 #include "models.h"
 #include "../llama-impl.h"
 #include <stdexcept>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
-// Debug function to dump tensor activations to disk
-static void dump_tensor_to_file(const char* name, struct ggml_tensor* tensor, int layer_idx) {
-    if (getenv("OLLAMA_DEBUG_ACTIVATIONS") == nullptr) return;
-
-    // Compute tensor first to ensure data is available
-    // Note: This assumes the tensor has been computed before this call
-
-    char filename[512];
-    if (layer_idx >= 0) {
-        snprintf(filename, sizeof(filename), "/tmp/ollama_layer_%02d_%s.bin", layer_idx, name);
-    } else {
-        snprintf(filename, sizeof(filename), "/tmp/ollama_%s.bin", name);
-    }
-
-    FILE* f = fopen(filename, "wb");
-    if (f) {
-        // Get tensor data and size
-        void* data = ggml_get_data(tensor);
-        size_t nbytes = ggml_nbytes(tensor);
-
-        // Write tensor data
-        size_t written = fwrite(data, 1, nbytes, f);
-        fclose(f);
-
-        fprintf(stderr, "[DEBUG] Dumped %s (layer %d): shape=[%lld, %lld, %lld, %lld], size=%zu bytes, written=%zu\n",
-                name, layer_idx,
-                (long long)tensor->ne[0], (long long)tensor->ne[1],
-                (long long)tensor->ne[2], (long long)tensor->ne[3],
-                nbytes, written);
-    } else {
-        fprintf(stderr, "[ERROR] Failed to open %s for writing\n", filename);
-    }
-}
 
 llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v;
@@ -55,15 +18,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
     // construct input embeddings (token, type, position)
     inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "tok_embd_lookup", -1);  // Track embedding lookup result
-
-    // DEBUG: Check tok_embd weights for ModernBERT
-    if (model.arch == LLM_ARCH_MODERNBERT && model.tok_embd) {
-        LLAMA_LOG_INFO("[DEBUG] tok_embd shape: [%lld, %lld]\n",
-            model.tok_embd->ne[0], model.tok_embd->ne[1]);
-        // Note: Can't easily print weight values here as they might not be in host memory
-        // We'll check the output embeddings instead
-    }
+    cb(inpL, "tok_embd_lookup", -1);
 
     // token types are hardcoded to zero ("Sentence A")
     if (model.type_embd) {
@@ -74,17 +29,6 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         inpL = ggml_add(ctx0, ggml_get_rows(ctx0, model.pos_embd, inp_pos), inpL);
     }
     cb(inpL, "inp_embd", -1);
-
-    // DEBUG: Log embedding tensor shapes
-    if (model.arch == LLM_ARCH_MODERNBERT) {
-        LLAMA_LOG_INFO("[MODERNBERT DEBUG] inp_embd shape: [%lld, %lld, %lld, %lld]\n",
-            (long long)inpL->ne[0], (long long)inpL->ne[1],
-            (long long)inpL->ne[2], (long long)inpL->ne[3]);
-        if (model.tok_embd) {
-            LLAMA_LOG_INFO("[MODERNBERT DEBUG] tok_embd weight shape: [%lld, %lld]\n",
-                (long long)model.tok_embd->ne[0], (long long)model.tok_embd->ne[1]);
-        }
-    }
 
     // embed layer norm
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);

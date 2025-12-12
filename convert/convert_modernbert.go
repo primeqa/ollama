@@ -89,14 +89,6 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv := p.ModelParameters.KV(t)
 
-	// DEBUG: Log tokenizer info
-	slog.Info("ModernBERT KV called",
-		"t.Tokens_count", len(t.Tokens),
-		"t.Vocabulary.Tokens_count", len(t.Vocabulary.Tokens),
-		"merge_count", len(t.Merges),
-		"first_token", t.Tokens[0],
-		"last_token", t.Tokens[len(t.Tokens)-1])
-
 	kv["general.architecture"] = "modernbert"
 	kv["modernbert.attention.causal"] = false
 	kv["modernbert.pooling_type"] = p.PoolingType
@@ -133,14 +125,6 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 
 func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	var out []*ggml.Tensor
-	skippedCount := 0
-	mlpWiCount := 0
-
-	// Debug: Log all input tensors
-	slog.Info("=== INPUT TENSORS ===", "total", len(ts))
-	for _, t := range ts {
-		slog.Info("Input tensor", "name", t.Name(), "shape", t.Shape())
-	}
 
 	for _, t := range ts {
 		// Skip pooler layers and position IDs (we do pooling in the runtime)
@@ -149,8 +133,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			"pooler.dense.weight",
 			"pooler.dense.bias",
 		}, t.Name()) {
-			slog.Info("SKIPPING pooler/position tensor", "name", t.Name())
-			skippedCount++
 			continue
 		}
 
@@ -171,26 +153,17 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
 				// Skip if it's a global layer (multiple of N) - this includes layer 0
 				if layer%int(globalAttnEveryN) == 0 {
-					slog.Info("SKIPPING attention bias for global layer", "layer", layer, "name", name)
-					skippedCount++
 					continue
-				} else {
-					slog.Info("KEEPING attention bias for local layer", "layer", layer, "name", name)
 				}
-			} else {
-				slog.Warn("Failed to parse layer number from attention bias tensor", "name", name, "layerName", layerName)
 			}
 		}
 
 		// ModernBERT uses GeGLU (Gated GELU) - the mlp.Wi tensor contains both gate and up weights fused
 		// We need to split it into two separate tensors
 		if strings.Contains(name, "mlp.Wi") {
-			// Get the fused tensor data
 			shape := t.Shape()
-			slog.Info("Splitting fused mlp.Wi tensor for GeGLU", "name", name, "shape", shape)
 			if len(shape) != 2 {
 				// Unexpected shape, just pass through
-				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
 				out = append(out, &ggml.Tensor{
 					Name:     name,
 					Kind:     t.Kind(),
@@ -206,12 +179,10 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			dim0 := shape[0]
 			dim1 := shape[1]
 			halfDim0 := dim0 / 2
-			slog.Debug("GeGLU split dimensions", "dim0", dim0, "dim1", dim1, "halfDim0", halfDim0)
 
 			// Create ffn_gate tensor (first half of rows)
 			// ModernBERT's mlp.Wi is organized as [gate; up] (concatenated along dim 0)
 			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
-			slog.Info("Creating ffn_gate from mlp.Wi (first half)", "name", gateName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     gateName,
 				Kind:     t.Kind(),
@@ -221,7 +192,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 
 			// Create ffn_up tensor (second half of rows)
 			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
-			slog.Info("Creating ffn_up from mlp.Wi (second half)", "name", upName, "shape", []uint64{halfDim0, dim1})
 			out = append(out, &ggml.Tensor{
 				Name:     upName,
 				Kind:     t.Kind(),
@@ -254,7 +224,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 	}
 
 	if !hasLayer0AttnNorm && embeddingsNormTensor != nil {
-		slog.Info("Layer 0 missing attn_output_norm, creating from token_embd_norm")
 		out = append(out, &ggml.Tensor{
 			Name:     "blk.0.attn_output_norm.weight",
 			Kind:     embeddingsNormTensor.Kind,
@@ -262,13 +231,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			WriterTo: embeddingsNormTensor.WriterTo,
 		})
 	}
-
-	slog.Info("=== TENSOR CONVERSION SUMMARY ===",
-		"input_tensors", len(ts),
-		"skipped_tensors", skippedCount,
-		"mlp_wi_split_count", mlpWiCount,
-		"output_tensors", len(out),
-		"net_change", len(out)-len(ts)+skippedCount)
 
 	return out
 }
