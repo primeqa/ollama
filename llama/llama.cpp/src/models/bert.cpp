@@ -1,8 +1,24 @@
 #include "models.h"
 #include "../llama-impl.h"
 #include <stdexcept>
+#include <vector>
+#include <cstdlib>
+#include <cstring>
+
+// DEBUG: Global storage for intermediate tensors
+static std::vector<debug_tensor_info> g_debug_tensors;
+static bool g_debug_layers_enabled = false;
 
 llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    // Check if layer debugging is enabled
+    const char* debug_env = std::getenv("OLLAMA_DEBUG_LAYERS");
+    g_debug_layers_enabled = (debug_env != nullptr && std::strcmp(debug_env, "1") == 0);
+
+    if (g_debug_layers_enabled) {
+        g_debug_tensors.clear();
+        LLAMA_LOG_INFO("[DEBUG] Layer debugging enabled for ModernBERT\n");
+        LLAMA_LOG_INFO("[DEBUG] model.arch = %d, LLM_ARCH_MODERNBERT = %d\n", (int)model.arch, (int)LLM_ARCH_MODERNBERT);
+    }
     const int64_t n_embd_head = hparams.n_embd_head_v;
     const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
 
@@ -20,24 +36,89 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "tok_embd_lookup", -1);
 
+    // CRITICAL FIX: For ModernBERT, mark embedding result as output to prevent buffer reuse
+    // The allocator aggressively reuses buffers, causing embedding values to be overwritten
+    // before they're used by downstream operations. Marking as OUTPUT extends the liveness window.
+    if (model.arch == LLM_ARCH_MODERNBERT) {
+        ggml_set_output(inpL);
+    }
+
+    // DEBUG: Track token embeddings immediately after lookup
+    if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+        g_debug_tensors.push_back({inpL, "tok_embd_only", -1});
+        LLAMA_LOG_INFO("[DEBUG] Input tokens: n_tokens=%ld\n", n_tokens);
+        LLAMA_LOG_INFO("[DEBUG] tok_embd tensor: %p, shape=[%ld, %ld], type=%d\n",
+                       (void*)model.tok_embd, (long)model.tok_embd->ne[0], (long)model.tok_embd->ne[1], (int)model.tok_embd->type);
+        LLAMA_LOG_INFO("[DEBUG] inpL (after get_rows): %p, shape=[%ld, %ld], type=%d, op=%d\n",
+                       (void*)inpL, (long)inpL->ne[0], (long)inpL->ne[1], (int)inpL->type, (int)inpL->op);
+        LLAMA_LOG_INFO("[DEBUG] Marked inpL as output to preserve buffer\n");
+    }
+
     // token types are hardcoded to zero ("Sentence A")
     if (model.type_embd) {
         ggml_tensor * type_row0 = ggml_view_1d(ctx0, model.type_embd, n_embd, 0);
-        inpL                    = ggml_add(ctx0, inpL, type_row0);
+        // WORKAROUND: For ModernBERT, force explicit copy of BOTH operands to avoid memory aliasing
+        LLAMA_LOG_INFO("[DEBUG RESIDUAL] Type embedding add: model.arch=%d, LLM_ARCH_MODERNBERT=%d\n", (int)model.arch, (int)LLM_ARCH_MODERNBERT);
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            LLAMA_LOG_INFO("[DEBUG RESIDUAL] Using ModernBERT workaround for type embedding add\n");
+            ggml_tensor* inpL_copy = ggml_dup_tensor(ctx0, inpL);
+            inpL_copy = ggml_cpy(ctx0, inpL, inpL_copy);
+            inpL_copy->flags |= GGML_TENSOR_FLAG_OUTPUT;
+
+            ggml_tensor* type_row0_copy = ggml_dup_tensor(ctx0, type_row0);
+            type_row0_copy = ggml_cpy(ctx0, type_row0, type_row0_copy);
+            type_row0_copy->flags |= GGML_TENSOR_FLAG_OUTPUT;
+
+            inpL = ggml_add(ctx0, inpL_copy, type_row0_copy);
+        } else {
+            LLAMA_LOG_INFO("[DEBUG RESIDUAL] Using standard add for type embedding\n");
+            inpL = ggml_add(ctx0, inpL, type_row0);
+        }
     }
     if (model.arch == LLM_ARCH_BERT) {
         inpL = ggml_add(ctx0, ggml_get_rows(ctx0, model.pos_embd, inp_pos), inpL);
     }
     cb(inpL, "inp_embd", -1);
 
+    // CRITICAL FIX: Protect embeddings before norm for ModernBERT
+    if (model.arch == LLM_ARCH_MODERNBERT) {
+        ggml_set_output(inpL);
+    }
+
+    // DEBUG: Track embeddings BEFORE norm
+    if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+        g_debug_tensors.push_back({inpL, "embeddings_pre_norm", -1});
+    }
+
     // embed layer norm
     inpL = build_norm(inpL, model.tok_norm, model.tok_norm_b, LLM_NORM, -1);
     cb(inpL, "inp_norm", -1);
-    cb(inpL, "DEBUG_embeddings", -1);  // DEBUG: Track embeddings
+
+    // CRITICAL FIX: Protect normalized embeddings for ModernBERT
+    if (model.arch == LLM_ARCH_MODERNBERT) {
+        ggml_set_output(inpL);
+    }
+
+    // DEBUG: Track embeddings AFTER norm
+    if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+        g_debug_tensors.push_back({inpL, "embeddings_post_norm", -1});
+        LLAMA_LOG_INFO("[DEBUG] Embeddings tensors added to debug list\n");
+    }
 
     auto * inp_attn = build_attn_inp_no_cache();
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // TEMPORARY: Disable inp_out_ids to test if it's causing layer skipping
+    // ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = nullptr;
+
+    // DEBUG: Check if inp_out_ids is set
+    if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+        if (inp_out_ids) {
+            LLAMA_LOG_INFO("[DEBUG] inp_out_ids is SET (will apply get_rows to last layer)\n");
+        } else {
+            LLAMA_LOG_INFO("[DEBUG] inp_out_ids is NULL (no special last layer handling)\n");
+        }
+    }
 
     // ModernBERT: Check if we need alternating attention pattern
     const bool use_alternating_attn = (model.arch == LLM_ARCH_MODERNBERT &&
@@ -45,6 +126,13 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * cur = inpL;
+
+        // DEBUG: Track inpL at start of layer
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char name[64];
+            snprintf(name, sizeof(name), "layer_%d_inpL_start", il);
+            g_debug_tensors.push_back({inpL, std::string(name), il});
+        }
 
         {
             ggml_tensor * Qcur;
@@ -110,19 +198,36 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             if (model.arch == LLM_ARCH_NOMIC_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
                 model.arch == LLM_ARCH_JINA_BERT_V3 || model.arch == LLM_ARCH_MODERNBERT) {
 
-                // ModernBERT: Use different RoPE theta for global vs local layers
-                float rope_freq_base_layer = freq_base;
-                if (use_alternating_attn) {
-                    const bool is_global_layer = (il % hparams.global_attn_every_n_layers == 0);
-                    rope_freq_base_layer = is_global_layer ? hparams.rope_freq_base_global
-                                                           : hparams.rope_freq_base_local;
+                // Get per-layer RoPE frequency for ModernBERT (global vs local)
+                const float freq_base_l  = model.arch == LLM_ARCH_MODERNBERT ? model.get_rope_freq_base(cparams, il)  : freq_base;
+                const float freq_scale_l = model.arch == LLM_ARCH_MODERNBERT ? model.get_rope_freq_scale(cparams, il) : freq_scale;
+
+                // DEBUG: Log RoPE parameters and Q/K/V values for ModernBERT layer 0
+                if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+                    LLAMA_LOG_INFO("[QKV_DEBUG] Layer %d: n_rot=%d, rope_type=%d, freq_base_l=%.1f, freq_scale_l=%.4f, is_swa=%d\n",
+                                   il, n_rot, rope_type, freq_base_l, freq_scale_l, hparams.is_swa(il));
+                    LLAMA_LOG_INFO("[QKV_DEBUG] Layer 0: Qcur shape=[%ld,%ld,%ld], Kcur shape=[%ld,%ld,%ld], Vcur shape=[%ld,%ld,%ld]\n",
+                                   Qcur->ne[0], Qcur->ne[1], Qcur->ne[2],
+                                   Kcur->ne[0], Kcur->ne[1], Kcur->ne[2],
+                                   Vcur->ne[0], Vcur->ne[1], Vcur->ne[2]);
+
+                    // Mark Q/K/V before RoPE as outputs so we can inspect them
+                    ggml_set_output(Qcur);
+                    ggml_set_output(Kcur);
+                    ggml_set_output(Vcur);
                 }
 
-                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, rope_freq_base_layer, freq_scale,
+                Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
 
-                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, rope_freq_base_layer, freq_scale,
+                Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
+
+                // DEBUG: Mark Q/K after RoPE as outputs for inspection
+                if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+                    ggml_set_output(Qcur);
+                    ggml_set_output(Kcur);
+                }
             }
 
             cb(Qcur, "Qcur", il);
@@ -134,28 +239,107 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             // Local layers use bidirectional sliding window attention (SYMMETRIC)
             // The build_attn function selects the appropriate mask based on hparams.is_swa(il)
 
+            // DEBUG: Log SWA status for first few layers
+            if (model.arch == LLM_ARCH_MODERNBERT && il < 3) {
+                const bool is_swa = hparams.is_swa(il);
+                const bool expected_global = (il % hparams.global_attn_every_n_layers == 0);
+                LLAMA_LOG_INFO("[MODERNBERT_ATTN] Layer %d: is_swa=%d, expected_global=%d, pattern=%u\n",
+                               il, is_swa, expected_global, hparams.global_attn_every_n_layers);
+            }
+
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
             cb(cur, "kqv_out", il);
+
+            // DEBUG: Track attention output
+            if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+                char attn_name[64];
+                snprintf(attn_name, sizeof(attn_name), "layer_%d_attn_out", il);
+                g_debug_tensors.push_back({cur, std::string(attn_name), il});
+            }
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
+            if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+                LLAMA_LOG_INFO("[DEBUG] Layer %d: Applying get_rows for last layer\n", il);
+            }
             cur  = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
 
-        // re-add the layer input
+        // DEBUG: Track both operands before residual add
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char name1[64], name2[64];
+            snprintf(name1, sizeof(name1), "layer_%d_cur_before_add", il);
+            snprintf(name2, sizeof(name2), "layer_%d_inpL_before_add", il);
+            g_debug_tensors.push_back({cur, std::string(name1), il});
+            g_debug_tensors.push_back({inpL, std::string(name2), il});
+        }
+
+        // CRITICAL FIX: Protect residual add operands and result
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(cur);   // Protect attention output
+            ggml_set_output(inpL);  // Protect input from previous layer
+        }
         cur = ggml_add(ctx0, cur, inpL);
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(cur);  // Protect residual add result
+        }
+
+        // DEBUG: Track after attention residual add
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char name[64];
+            snprintf(name, sizeof(name), "layer_%d_attn_residual_add", il);
+            g_debug_tensors.push_back({cur, std::string(name), il});
+        }
+
+        // DEBUG: Log before attn_out_norm decision
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d BEFORE attn_out_norm: is_swa=%d, cur=%p\n",
+                           il, hparams.is_swa(il), (void*)cur);
+            ggml_set_output(cur);
+        }
+
+        // CRITICAL: For ModernBERT, save the value BEFORE normalization for FFN residual add
+        // HuggingFace does: hidden_states = hidden_states + mlp_output
+        // where hidden_states is the value BEFORE mlp_norm, not after
+        ggml_tensor * ffn_residual_base = cur;  // Save unnormalized value for residual add
 
         // attention layer norm
-        cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
+        // CRITICAL: ModernBERT layer 0 is special - it has NO attn_out_norm tensor
+        // All other layers (including global layers 3, 6, 9...) DO have attn_out_norm
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            // Layer 0: Skip attn_out_norm (tensor doesn't exist)
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: Skipping attn_out_norm (layer 0 has no attn_norm tensor)\n", il);
+        } else {
+            // All other layers: Apply normalization
+            if (model.arch == LLM_ARCH_MODERNBERT) {
+                LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: Applying attn_out_norm (is_swa=%d)\n", il, hparams.is_swa(il));
+            }
+            cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
+        }
+
+        // DEBUG: Log after attn_out_norm
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d AFTER attn_out_norm: cur=%p\n", il, (void*)cur);
+            ggml_set_output(cur);
+        }
+
+        // DEBUG: Track after attention norm (= FFN input)
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char name[64];
+            snprintf(name, sizeof(name), "layer_%d_ffn_input", il);
+            g_debug_tensors.push_back({cur, std::string(name), il});
+        }
 
         if (model.layers[il].attn_norm_2 != nullptr) {
             cur = ggml_add(ctx0, cur, inpL);  // re-add the layer input
             cur = build_norm(cur, model.layers[il].attn_norm_2, model.layers[il].attn_norm_2_b, LLM_NORM, il);
         }
 
+        // For ModernBERT, use the normalized cur as FFN input, but use ffn_residual_base for residual add
+        // For other models, use cur for both (preserves existing behavior)
         ggml_tensor * ffn_inp = cur;
         cb(ffn_inp, "ffn_inp", il);
 
@@ -204,34 +388,115 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             cb(cur, "ffn_out", il);
         }
 
-        // attentions bypass the intermediate layer
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        // DEBUG: Track FFN output before residual
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char ffn_pre_name[64];
+            snprintf(ffn_pre_name, sizeof(ffn_pre_name), "layer_%d_ffn_pre_residual", il);
+            g_debug_tensors.push_back({cur, std::string(ffn_pre_name), il});
+        }
+
+        // DEBUG: Log FFN output
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: FFN output cur=%p, ffn_inp=%p, ffn_residual_base=%p\n",
+                           il, (void*)cur, (void*)ffn_inp, (void*)ffn_residual_base);
+        }
+
+        // CRITICAL FIX: Protect FFN residual add operands and result
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(cur);                // Protect FFN output
+            ggml_set_output(ffn_residual_base);  // Protect residual base (unnormalized attention output)
+        }
+        // CRITICAL: For ModernBERT, add FFN output to the UNNORMALIZED value (ffn_residual_base)
+        // This matches HuggingFace: hidden_states = hidden_states + mlp_output
+        // where hidden_states is the value BEFORE mlp_norm
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            cur = ggml_add(ctx0, cur, ffn_residual_base);
+        } else {
+            cur = ggml_add(ctx0, cur, ffn_inp);
+        }
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(cur);  // Protect FFN residual add result
+        }
+
+        // DEBUG: Log after FFN residual add
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: After FFN residual add cur=%p\n", il, (void*)cur);
+        }
+
+        // DEBUG: Track after FFN residual add
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char ffn_post_name[64];
+            snprintf(ffn_post_name, sizeof(ffn_post_name), "layer_%d_ffn_post_residual", il);
+            g_debug_tensors.push_back({cur, std::string(ffn_post_name), il});
+        }
 
         // output layer norm
-        cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
+        // CRITICAL: ModernBERT does NOT have layer_out_norm
+        // The layer output is the FFN residual add result (no final normalization)
+        if (model.arch != LLM_ARCH_MODERNBERT) {
+            cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
+        }
 
         // input for next layer
         inpL = cur;
 
+        // DEBUG: Log final layer output
+        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
+            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: Final output inpL=%p\n", il, (void*)inpL);
+        }
+
+        // CRITICAL FIX: Protect layer outputs for ModernBERT
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(inpL);
+        }
+
         // DEBUG: Track layer output
-        {
-            char debug_name[64];
-            snprintf(debug_name, sizeof(debug_name), "DEBUG_layer_%d", il);
-            cb(inpL, debug_name, il);
+        if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+            char layer_name[64];
+            snprintf(layer_name, sizeof(layer_name), "layer_%d", il);
+            g_debug_tensors.push_back({inpL, std::string(layer_name), il});
         }
     }
 
     cur = inpL;
 
-    // ModernBERT: Apply final normalization layer
-    if (model.arch == LLM_ARCH_MODERNBERT && model.output_norm) {
+    // CRITICAL: ModernBERT does NOT have output_norm!
+    // The final output is directly from the last layer (no additional normalization)
+    // Only apply output_norm for other BERT models
+    if (model.arch != LLM_ARCH_MODERNBERT && model.output_norm) {
         cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
         cb(cur, "result_norm", -1);
-        cb(cur, "DEBUG_final_norm", -1);  // DEBUG: Track final norm output
+
+        // DEBUG: Track final norm output
+        if (g_debug_layers_enabled) {
+            g_debug_tensors.push_back({cur, "final_norm", -2});
+        }
+    }
+
+    // Apply L2 normalization if requested (for sentence-transformers models)
+    // This is separate from LayerNorm and applies to the final embeddings
+    if (model.arch == LLM_ARCH_MODERNBERT && hparams.normalize_embeddings) {
+        // FIX: Use ggml_l2_norm for L2 vector normalization, not ggml_norm (layer norm)
+        cur = ggml_l2_norm(ctx0, cur, 1e-12f);
+        cb(cur, "result_l2_norm", -1);
+    }
+
+    // DEBUG: Mark final output for layer-by-layer debugging
+    if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
+        g_debug_tensors.push_back({cur, "final_output", -2});
     }
 
     cb(cur, "result_embd", -1);
     res->t_embd = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+// DEBUG: Function to retrieve debug tensors for inspection after computation
+std::vector<debug_tensor_info> & llm_get_debug_tensors() {
+    return g_debug_tensors;
+}
+
+bool llm_debug_layers_enabled() {
+    return g_debug_layers_enabled;
 }
