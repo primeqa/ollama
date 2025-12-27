@@ -933,20 +933,29 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_LOCAL_ATTN_WINDOW, hparams.local_attn_window, (uint32_t)0);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_LOCAL,  hparams.rope_freq_base_local,  10000.0f);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
+                ml.get_key(LLM_KV_POOLING_NORMALIZE_EMBEDDINGS, hparams.normalize_embeddings, false);
+
+                LLAMA_LOG_INFO("[ModernBERT DEBUG] global_attn_every_n_layers=%u, local_attn_window=%u\n",
+                               hparams.global_attn_every_n_layers, hparams.local_attn_window);
 
                 // Set up sliding window attention for local layers
                 if (hparams.global_attn_every_n_layers > 0 && hparams.local_attn_window > 0) {
                     hparams.n_swa = hparams.local_attn_window;
                     hparams.set_swa_pattern(hparams.global_attn_every_n_layers, true);  // dense_first = true
 
+                    LLAMA_LOG_INFO("[ModernBERT DEBUG] is_swa_any()=%d\n", hparams.is_swa_any());
+
                     // Only enable SWA if there are actually layers that use it
                     if (hparams.is_swa_any()) {
                         hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;  // bidirectional SWA for encoder
+                        LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to SYMMETRIC\n");
                     } else {
                         hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+                        LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to NONE (no SWA layers found)\n");
                     }
                 } else {
                     hparams.swa_type = LLAMA_SWA_TYPE_NONE;
+                    LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to NONE (missing params)\n");
                 }
 
                 if (hparams.n_layer == 22 && hparams.n_embd == 768) {
@@ -7029,6 +7038,12 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
+    // ModernBERT uses different RoPE frequencies for global vs local layers
+    if (arch == LLM_ARCH_MODERNBERT) {
+        // Global layers (non-SWA) use rope_freq_base_global
+        // Local layers (SWA) use rope_freq_base_local
+        return hparams.is_swa(il) ? hparams.rope_freq_base_local : hparams.rope_freq_base_global;
+    }
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
 
@@ -7221,9 +7236,12 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_JINA_BERT_V3:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
-        case LLM_ARCH_MODERNBERT:
             {
                 llm = std::make_unique<llm_build_bert>(*this, params);
+            } break;
+        case LLM_ARCH_MODERNBERT:
+            {
+                llm = std::make_unique<llm_build_modernbert>(*this, params);
             } break;
         case LLM_ARCH_NEO_BERT:
             {

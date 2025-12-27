@@ -9,7 +9,7 @@
 static std::vector<debug_tensor_info> g_debug_tensors;
 static bool g_debug_layers_enabled = false;
 
-llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llm_build_modernbert::llm_build_modernbert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     // Check if layer debugging is enabled
     const char* debug_env = std::getenv("OLLAMA_DEBUG_LAYERS");
     g_debug_layers_enabled = (debug_env != nullptr && std::strcmp(debug_env, "1") == 0);
@@ -134,6 +134,26 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             g_debug_tensors.push_back({inpL, std::string(name), il});
         }
 
+        // PRE-NORM: Apply attn_norm BEFORE attention computation
+        // ModernBERT layer 0 has no attn_norm (acts as identity), layers 1-21 have it
+        ggml_tensor * attn_residual_base = cur;  // Save unnormalized input for residual add
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            if (il == 0) {
+                // Layer 0: No attn_norm tensor (identity/no-op in HuggingFace)
+                LLAMA_LOG_INFO("[PRE_NORM_V2] Layer %d: Skipping attn_norm (layer 0 has no attn_norm tensor)\n", il);
+            } else {
+                // Layers 1-21: Apply normalization BEFORE attention
+                LLAMA_LOG_INFO("[PRE_NORM_V2] Layer %d: Applying attn_norm BEFORE attention\n", il);
+                cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
+                cb(cur, "attn_norm", il);
+                if (g_debug_layers_enabled) {
+                    char name[64];
+                    snprintf(name, sizeof(name), "layer_%d_attn_norm_out", il);
+                    g_debug_tensors.push_back({cur, std::string(name), il});
+                }
+            }
+        }
+
         {
             ggml_tensor * Qcur;
             ggml_tensor * Kcur;
@@ -148,8 +168,9 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
                 if (!model.layers[il].wo) {
                     throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output tensor (wo)");
                 }
-                if (!model.layers[il].attn_out_norm) {
-                    throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output norm tensor");
+                // Only check for attn_out_norm in non-ModernBERT or layer != 0
+                if (model.arch != LLM_ARCH_MODERNBERT && !model.layers[il].attn_out_norm) {
+                    throw std::runtime_error("Layer " + std::to_string(il) + " missing attention output norm tensor");
                 }
             }
 
@@ -272,19 +293,21 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
             char name1[64], name2[64];
             snprintf(name1, sizeof(name1), "layer_%d_cur_before_add", il);
-            snprintf(name2, sizeof(name2), "layer_%d_inpL_before_add", il);
+            snprintf(name2, sizeof(name2), "layer_%d_attn_residual_base_before_add", il);
             g_debug_tensors.push_back({cur, std::string(name1), il});
-            g_debug_tensors.push_back({inpL, std::string(name2), il});
+            g_debug_tensors.push_back({attn_residual_base, std::string(name2), il});
         }
 
-        // CRITICAL FIX: Protect residual add operands and result
+        // PRE-NORM: Add attention output to UNNORMALIZED input
+        // This matches HuggingFace: hidden_states = attention_output + hidden_states
+        // where hidden_states is the value BEFORE attn_norm
         if (model.arch == LLM_ARCH_MODERNBERT) {
-            ggml_set_output(cur);   // Protect attention output
-            ggml_set_output(inpL);  // Protect input from previous layer
-        }
-        cur = ggml_add(ctx0, cur, inpL);
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(cur);                   // Protect attention output
+            ggml_set_output(attn_residual_base);    // Protect unnormalized input
+            cur = ggml_add(ctx0, cur, attn_residual_base);
             ggml_set_output(cur);  // Protect residual add result
+        } else {
+            cur = ggml_add(ctx0, cur, inpL);
         }
 
         // DEBUG: Track after attention residual add
@@ -294,39 +317,32 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             g_debug_tensors.push_back({cur, std::string(name), il});
         }
 
-        // DEBUG: Log before attn_out_norm decision
-        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
-            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d BEFORE attn_out_norm: is_swa=%d, cur=%p\n",
-                           il, hparams.is_swa(il), (void*)cur);
-            ggml_set_output(cur);
-        }
-
-        // CRITICAL: For ModernBERT, save the value BEFORE normalization for FFN residual add
+        // PRE-NORM: For ModernBERT, save the value BEFORE mlp_norm for FFN residual add
         // HuggingFace does: hidden_states = hidden_states + mlp_output
         // where hidden_states is the value BEFORE mlp_norm, not after
         ggml_tensor * ffn_residual_base = cur;  // Save unnormalized value for residual add
 
-        // attention layer norm
-        // CRITICAL: ModernBERT layer 0 is special - it has NO attn_out_norm tensor
-        // All other layers (including global layers 3, 6, 9...) DO have attn_out_norm
-        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
-            // Layer 0: Skip attn_out_norm (tensor doesn't exist)
-            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: Skipping attn_out_norm (layer 0 has no attn_norm tensor)\n", il);
-        } else {
-            // All other layers: Apply normalization
-            if (model.arch == LLM_ARCH_MODERNBERT) {
-                LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d: Applying attn_out_norm (is_swa=%d)\n", il, hparams.is_swa(il));
+        // PRE-NORM: Apply mlp_norm BEFORE FFN computation (for ModernBERT)
+        // Note: In POST-NORM architectures, this normalization happened after the residual add
+        // In PRE-NORM, we apply it here before the FFN
+        // The converter maps HF's 'mlp_norm' to llama.cpp's 'layer_out_norm'
+        if (model.arch == LLM_ARCH_MODERNBERT) {
+            // All layers (0-21) should have mlp_norm (layer_out_norm in llama.cpp naming)
+            if (model.layers[il].layer_out_norm) {
+                LLAMA_LOG_INFO("[PRE_NORM_V2] Layer %d: Applying mlp_norm BEFORE FFN\n", il);
+                cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
+                cb(cur, "mlp_norm", il);
+                if (g_debug_layers_enabled) {
+                    char name[64];
+                    snprintf(name, sizeof(name), "layer_%d_mlp_norm_out", il);
+                    g_debug_tensors.push_back({cur, std::string(name), il});
+                }
+            } else {
+                LLAMA_LOG_INFO("[PRE_NORM_V2] Layer %d: WARNING - No mlp_norm (layer_out_norm) tensor!\n", il);
             }
-            cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
         }
 
-        // DEBUG: Log after attn_out_norm
-        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
-            LLAMA_LOG_INFO("[NaN_DEBUG] Layer %d AFTER attn_out_norm: cur=%p\n", il, (void*)cur);
-            ggml_set_output(cur);
-        }
-
-        // DEBUG: Track after attention norm (= FFN input)
+        // DEBUG: Track FFN input (after mlp_norm for ModernBERT)
         if (g_debug_layers_enabled && model.arch == LLM_ARCH_MODERNBERT) {
             char name[64];
             snprintf(name, sizeof(name), "layer_%d_ffn_input", il);
@@ -431,8 +447,10 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         }
 
         // output layer norm
-        // CRITICAL: ModernBERT does NOT have layer_out_norm
-        // The layer output is the FFN residual add result (no final normalization)
+        // CRITICAL: ModernBERT uses PRE-NORM architecture
+        // - layer_out_norm is applied BEFORE FFN (as mlp_norm), not here after FFN
+        // - The layer output is the FFN residual add result (no POST-normalization)
+        // Other architectures use POST-NORM and apply layer_out_norm here
         if (model.arch != LLM_ARCH_MODERNBERT) {
             cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
         }
@@ -490,4 +508,13 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     res->t_embd = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+// DEBUG: Function to retrieve debug tensors for inspection after computation
+std::vector<debug_tensor_info> & llm_get_debug_tensors() {
+    return g_debug_tensors;
+}
+
+bool llm_debug_layers_enabled() {
+    return g_debug_layers_enabled;
 }
