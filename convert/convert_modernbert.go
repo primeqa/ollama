@@ -3,15 +3,18 @@ package convert
 import (
 	"bytes"
 	"cmp"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/x448/float16"
 )
 
 type modernBertModel struct {
@@ -211,31 +214,53 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 		}
 	}
 
-	// Special case: Layer 0 in ModernBERT doesn't have attn_output_norm in the source model
-	// because input is already normalized from embeddings.norm. But llama.cpp expects it,
-	// so we create a synthetic one by copying embeddings.norm
+	// PRE-NORM Architecture: Layer 0 does NOT have attn_norm in source model (it's Identity/no-op in HuggingFace)
+	// However, llama.cpp graph builder may need a tensor to exist. Create an identity norm (all 1s) for layer 0
 	hasLayer0AttnNorm := false
-	var embeddingsNormTensor *ggml.Tensor
+	var hiddenSize uint64
 
 	for _, t := range out {
 		if t.Name == "blk.0.attn_output_norm.weight" {
 			hasLayer0AttnNorm = true
 		}
-		if t.Name == "token_embd_norm.weight" {
-			embeddingsNormTensor = t
+		// Get hidden size from any layer's attn_output_norm (they all have same size)
+		if strings.Contains(t.Name, "attn_output_norm.weight") {
+			if len(t.Shape) > 0 {
+				hiddenSize = t.Shape[0]
+			}
 		}
 	}
 
-	if !hasLayer0AttnNorm && embeddingsNormTensor != nil {
+	if !hasLayer0AttnNorm && hiddenSize > 0 {
+		// Create identity LayerNorm for layer 0 (weight=1.0, bias=0.0)
 		out = append(out, &ggml.Tensor{
 			Name:     "blk.0.attn_output_norm.weight",
-			Kind:     embeddingsNormTensor.Kind,
-			Shape:    embeddingsNormTensor.Shape,
-			WriterTo: embeddingsNormTensor.WriterTo,
+			Kind:     tensorKindFP32,
+			Shape:    []uint64{hiddenSize},
+			WriterTo: &identityTensor{size: hiddenSize, value: 1.0},
 		})
 	}
 
 	return out
+}
+
+// identityTensor creates a tensor filled with a constant value
+type identityTensor struct {
+	size  uint64
+	value float32
+}
+
+func (it *identityTensor) WriteTo(w io.Writer) (n int64, err error) {
+	buf := make([]byte, 4)
+	for i := uint64(0); i < it.size; i++ {
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(it.value))
+		written, err := w.Write(buf)
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // getTensorKindSize returns the size in bytes for each element type
@@ -253,11 +278,116 @@ func getTensorKindSize(kind uint32) uint64 {
 	}
 }
 
+// tensorF32Wrapper wraps a tensor and forces it to be written as F32
+type tensorF32Wrapper struct {
+	source Tensor
+}
+
+func (t *tensorF32Wrapper) Name() string {
+	return t.source.Name()
+}
+
+func (t *tensorF32Wrapper) Kind() uint32 {
+	return tensorKindFP32 // Always return F32
+}
+
+func (t *tensorF32Wrapper) Shape() []uint64 {
+	return t.source.Shape()
+}
+
+func (t *tensorF32Wrapper) SetRepacker(fn Repacker) {
+	t.source.SetRepacker(fn)
+}
+
+func (t *tensorF32Wrapper) WriteTo(w io.Writer) (int64, error) {
+	// Write source to buffer first
+	var buf bytes.Buffer
+	if _, err := t.source.WriteTo(&buf); err != nil {
+		return 0, err
+	}
+
+	// If source is already F32, just write the buffer
+	if t.source.Kind() == tensorKindFP32 {
+		nn, err := w.Write(buf.Bytes())
+		return int64(nn), err
+	}
+
+	// Convert F16 to F32
+	data := buf.Bytes()
+	if t.source.Kind() == tensorKindFP16 {
+		// Read as F16
+		numElements := len(data) / 2
+		f32s := make([]float32, numElements)
+
+		for i := 0; i < numElements; i++ {
+			u16 := uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
+			f32s[i] = float16.Frombits(u16).Float32()
+		}
+
+		// Write as F32
+		return int64(len(f32s) * 4), binary.Write(w, binary.LittleEndian, f32s)
+	}
+
+	// Convert BF16 to F32
+	if t.source.Kind() == tensorKindBF16 {
+		// Read as BF16
+		numElements := len(data) / 2
+		f32s := make([]float32, numElements)
+
+		for i := 0; i < numElements; i++ {
+			// BF16 is just the top 16 bits of F32
+			// To convert: shift BF16 value left by 16 bits
+			u16 := uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
+			u32 := uint32(u16) << 16
+			f32s[i] = math.Float32frombits(u32)
+		}
+
+		// Write as F32
+		return int64(len(f32s) * 4), binary.Write(w, binary.LittleEndian, f32s)
+	}
+
+	// For other types, just pass through
+	nn, err := w.Write(data)
+	return int64(nn), err
+}
+
+func (t *tensorF32Wrapper) Clone() Tensor {
+	return &tensorF32Wrapper{source: t.source.Clone()}
+}
+
 // splitTensorRows handles splitting a fused tensor along dimension 0 (rows)
 type splitTensorRows struct {
 	source Tensor
 	offset uint64 // starting row
 	rows   uint64 // number of rows to extract
+}
+
+func (st *splitTensorRows) Name() string {
+	return st.source.Name()
+}
+
+func (st *splitTensorRows) Kind() uint32 {
+	return st.source.Kind()
+}
+
+func (st *splitTensorRows) Shape() []uint64 {
+	shape := st.source.Shape()
+	if len(shape) == 2 {
+		return []uint64{st.rows, shape[1]}
+	}
+	return shape
+}
+
+func (st *splitTensorRows) SetRepacker(fn Repacker) {
+	st.source.SetRepacker(fn)
+}
+
+func (st *splitTensorRows) Clone() Tensor {
+	return &splitTensorRows{
+		source: st.source.Clone(),
+		offset: st.offset,
+		rows:   st.rows,
+	}
 }
 
 func (st *splitTensorRows) WriteTo(w io.Writer) (n int64, err error) {
