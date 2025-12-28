@@ -133,6 +133,7 @@ struct llama_hparams {
     uint32_t local_attn_window = 0;          // sliding window size for local attention layers
     float    rope_freq_base_local = 10000.0f; // RoPE theta for local attention layers
     float    rope_freq_base_global = 10000.0f; // RoPE theta for global attention layers
+    bool     normalize_embeddings = false;   // whether to apply L2 normalization to final embeddings
 
     // for State Space Models
     uint32_t ssm_d_conv  = 0;
