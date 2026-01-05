@@ -168,6 +168,15 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		opts.NumCtx = int(trainCtx)
 	}
 
+	// For ModernBERT models, batch size must be >= input tokens because encoder
+	// models process all tokens together in a single batch. Unlike classic BERT
+	// which has a 512 token limit due to learned position embeddings, ModernBERT
+	// uses RoPE and supports longer sequences up to its context length.
+	if f.KV().Architecture() == "modernbert" {
+		opts.NumBatch = opts.NumCtx
+		slog.Debug("modernbert model detected, setting batch size to context size", "num_batch", opts.NumBatch)
+	}
+
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
 	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}
