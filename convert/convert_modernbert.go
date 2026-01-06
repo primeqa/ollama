@@ -90,7 +90,10 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 }
 
 func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
+	slog.Info("=== ModernBERT KV() called ===")
+	slog.Info("Tokenizer.Pre value from tokenizer.go", "pre", t.Pre)
 	kv := p.ModelParameters.KV(t)
+	slog.Info("After ModelParameters.KV(), tokenizer.ggml.pre", "value", kv["tokenizer.ggml.pre"])
 
 	kv["general.architecture"] = "modernbert"
 	kv["modernbert.attention.causal"] = false
@@ -115,7 +118,12 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 
 	// ModernBERT uses GPT2/BPE tokenizer (like RoBERTa), not BERT WordPiece
 	kv["tokenizer.ggml.model"] = "gpt2"
+	// CRITICAL: Must use "gpt-2" pre-tokenizer, not "default"!
+	// "default" has extra regex patterns that split numbers incorrectly
+	slog.Info("Setting tokenizer.ggml.pre to 'gpt-2' for ModernBERT")
+	kv["tokenizer.ggml.pre"] = "gpt-2"
 	kv["tokenizer.ggml.token_type_count"] = uint32(2)
+	slog.Info("ModernBERT tokenizer configured", "model", kv["tokenizer.ggml.model"], "pre", kv["tokenizer.ggml.pre"])
 
 	// Tokens are already set by ModelParameters.KV(t) - don't overwrite
 
@@ -126,13 +134,20 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv["tokenizer.ggml.add_bos_token"] = true
 	kv["tokenizer.ggml.add_eos_token"] = true
 
+	slog.Info("=== Final KV check before return ===")
+	slog.Info("Returning kv map", "tokenizer.ggml.pre", kv["tokenizer.ggml.pre"], "tokenizer.ggml.model", kv["tokenizer.ggml.model"])
+
 	return kv
 }
 
 func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
+	slog.Info("TENSORS_DEBUG: Tensors() called", "count", len(ts))
 	var out []*ggml.Tensor
 
-	for _, t := range ts {
+	for i, t := range ts {
+		if i < 5 || strings.Contains(t.Name(), "Wqkv") {
+			slog.Info("TENSORS_DEBUG: Processing tensor", "index", i, "name", t.Name(), "shape", t.Shape())
+		}
 		// Skip pooler layers and position IDs (we do pooling in the runtime)
 		if slices.Contains([]string{
 			"embeddings.position_ids",
@@ -163,6 +178,7 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 				}
 			}
 		}
+
 
 		// ModernBERT uses GeGLU (Gated GELU) - the mlp.Wi tensor contains both gate and up weights fused
 		// We need to split it into two separate tensors
