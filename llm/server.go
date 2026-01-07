@@ -168,6 +168,18 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		opts.NumCtx = int(trainCtx)
 	}
 
+	// For ModernBERT models, set context to full training context and batch size
+	// must be >= input tokens because encoder models process all tokens together.
+	if f.KV().Architecture() == "modernbert" {
+		// Use full training context for embedding models to avoid "input exceeds context" errors
+		if trainCtx > 0 && opts.NumCtx < int(trainCtx) {
+			opts.NumCtx = int(trainCtx)
+			slog.Debug("modernbert model detected, setting context to training context", "num_ctx", opts.NumCtx)
+		}
+		opts.NumBatch = opts.NumCtx
+		slog.Debug("modernbert model detected, setting batch size to context size", "num_batch", opts.NumBatch)
+	}
+
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
 	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache()}

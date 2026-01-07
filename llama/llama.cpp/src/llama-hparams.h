@@ -165,6 +165,7 @@ struct llama_hparams {
     bool use_alibi     = false;
     bool attn_soft_cap = false;
     bool use_kq_norm   = false;
+    bool normalize_embeddings = false;  // whether to apply L2 normalization to final embeddings
 
     // for Classifiers
     uint32_t n_cls_out = 1;

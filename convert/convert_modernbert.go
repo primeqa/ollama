@@ -3,16 +3,18 @@ package convert
 import (
 	"bytes"
 	"cmp"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
-	"path/filepath"
+	"math"
 	"slices"
 	"strings"
 
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/x448/float16"
 )
 
 type modernBertModel struct {
@@ -22,7 +24,7 @@ type modernBertModel struct {
 	HiddenSize                uint32  `json:"hidden_size"`
 	IntermediateSize          uint32  `json:"intermediate_size"`
 	NumAttentionHeads         uint32  `json:"num_attention_heads"`
-	LayerNormEPS              float32 `json:"layer_norm_eps"`
+	LayerNormEPS              float32 `json:"norm_eps"`
 	GlobalAttnEveryNLayers    uint32  `json:"global_attn_every_n_layers"`
 	LocalAttention            uint32  `json:"local_attention"`
 	LocalRopeTheta            float32 `json:"local_rope_theta"`
@@ -40,66 +42,58 @@ var (
 
 func (p *modernBertModel) parseMore(fsys fs.FS) error {
 	// Parse sentence_transformers module config if present
+	var hasPoolingModule bool
 	bts, err := fs.ReadFile(fsys, "modules.json")
-	if err != nil {
-		// Not all models have this, return nil if missing
-		return nil
-	}
-
-	var modules []struct {
-		Type string `json:"type"`
-		Path string `json:"path"`
-	}
-
-	if err := json.Unmarshal(bts, &modules); err != nil {
-		return err
-	}
-
-	var pooling string
-	for _, m := range modules {
-		switch m.Type {
-		case "sentence_transformers.models.Pooling":
-			pooling = m.Path
-		case "sentence_transformers.models.Normalize":
-			p.normalizeEmbeddings = true
+	if err == nil {
+		// modules.json exists, parse it
+		var modules []struct {
+			Type string `json:"type"`
+			Path string `json:"path"`
 		}
-	}
 
-	if pooling != "" {
-		bts, err := fs.ReadFile(fsys, filepath.Join(pooling, "config.json"))
-		if err == nil {
-			var pc struct {
-				PoolingModeCLSToken   bool `json:"pooling_mode_cls_token"`
-				PoolingModeMeanTokens bool `json:"pooling_mode_mean_tokens"`
-			}
+		if err := json.Unmarshal(bts, &modules); err != nil {
+			return err
+		}
 
-			if err := json.Unmarshal(bts, &pc); err == nil {
-				if pc.PoolingModeMeanTokens {
-					p.PoolingType = 1 // Mean pooling
-					return nil
-				} else if pc.PoolingModeCLSToken {
-					p.PoolingType = 2 // CLS pooling
-					return nil
-				}
+		for _, m := range modules {
+			switch m.Type {
+			case "sentence_transformers.models.Pooling":
+				hasPoolingModule = true
+			case "sentence_transformers.models.Normalize":
+				p.normalizeEmbeddings = true
 			}
 		}
-		// If pooling config file missing or invalid, fall through to default
 	}
 
-	// ModernBERT uses CLS pooling by default based on classifier_pooling
-	// Debug: log what we're seeing
-	slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling, "pooling_path", pooling)
-	if p.ClassifierPooling == "mean" {
-		p.PoolingType = 1 // Mean pooling
+	// Set pooling type based on available information
+	// Priority: modules.json Pooling module > classifier_pooling config
+	if hasPoolingModule {
+		// ModernBERT embedding models use CLS pooling (first token)
+		// The modules.json indicates this is a sentence-transformers model with a Pooling module
+		slog.Debug("modernbert: detected sentence-transformers Pooling module, using CLS pooling")
+		p.PoolingType = 2 // CLS pooling for embedding models
 	} else {
-		p.PoolingType = 2 // CLS pooling (default)
+		// No pooling module - fall back to classifier_pooling setting from config.json
+		slog.Debug("modernbert pooling config", "classifier_pooling", p.ClassifierPooling)
+		if p.ClassifierPooling == "mean" {
+			p.PoolingType = 1 // Mean pooling
+		} else if p.ClassifierPooling == "cls" {
+			p.PoolingType = 2 // CLS pooling
+		} else {
+			// Default to CLS pooling for ModernBERT
+			slog.Warn("modernbert: unknown classifier_pooling value, defaulting to CLS", "value", p.ClassifierPooling)
+			p.PoolingType = 2
+		}
 	}
 
 	return nil
 }
 
 func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
+	slog.Info("=== ModernBERT KV() called ===")
+	slog.Info("Tokenizer.Pre value from tokenizer.go", "pre", t.Pre)
 	kv := p.ModelParameters.KV(t)
+	slog.Info("After ModelParameters.KV(), tokenizer.ggml.pre", "value", kv["tokenizer.ggml.pre"])
 
 	kv["general.architecture"] = "modernbert"
 	kv["modernbert.attention.causal"] = false
@@ -119,28 +113,41 @@ func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
 	kv["modernbert.rope.freq_base_local"] = cmp.Or(p.LocalRopeTheta, 10000.0)
 	kv["modernbert.rope.freq_base_global"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
 
-	kv["tokenizer.ggml.model"] = "bert"
+	// Set general rope.freq_base to the global value (used as default by llama.cpp)
+	kv["general.rope.freq_base"] = cmp.Or(p.GlobalRopeTheta, 80000.0)
+
+	// ModernBERT uses GPT2/BPE tokenizer (like RoBERTa), not BERT WordPiece
+	kv["tokenizer.ggml.model"] = "gpt2"
+	// CRITICAL: Must use "gpt-2" pre-tokenizer, not "default"!
+	// "default" has extra regex patterns that split numbers incorrectly
+	slog.Info("Setting tokenizer.ggml.pre to 'gpt-2' for ModernBERT")
+	kv["tokenizer.ggml.pre"] = "gpt-2"
 	kv["tokenizer.ggml.token_type_count"] = uint32(2)
+	slog.Info("ModernBERT tokenizer configured", "model", kv["tokenizer.ggml.model"], "pre", kv["tokenizer.ggml.pre"])
 
-	// Convert to phantom space tokens (like BERT/NomicBERT)
-	for i, e := range t.Tokens {
-		if strings.HasPrefix(e, "[") && strings.HasSuffix(e, "]") {
-			// Keep special tokens as-is
-		} else if strings.HasPrefix(e, "##") {
-			t.Tokens[i] = e[2:]
-		} else {
-			t.Tokens[i] = "\u2581" + e
-		}
-	}
+	// Tokens are already set by ModelParameters.KV(t) - don't overwrite
 
-	kv["tokenizer.ggml.tokens"] = t.Tokens
+	// BERT-like models need CLS (as BOS) and SEP (as EOS) tokens added automatically
+	// llama.cpp uses add_bos_token and add_eos_token with bos_token_id and eos_token_id
+	kv["tokenizer.ggml.bos_token_id"] = uint32(50281) // CLS token
+	kv["tokenizer.ggml.eos_token_id"] = uint32(50282) // SEP token
+	kv["tokenizer.ggml.add_bos_token"] = true
+	kv["tokenizer.ggml.add_eos_token"] = true
+
+	slog.Info("=== Final KV check before return ===")
+	slog.Info("Returning kv map", "tokenizer.ggml.pre", kv["tokenizer.ggml.pre"], "tokenizer.ggml.model", kv["tokenizer.ggml.model"])
 
 	return kv
 }
 
 func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
+	slog.Info("TENSORS_DEBUG: Tensors() called", "count", len(ts))
 	var out []*ggml.Tensor
-	for _, t := range ts {
+
+	for i, t := range ts {
+		if i < 5 || strings.Contains(t.Name(), "Wqkv") {
+			slog.Info("TENSORS_DEBUG: Processing tensor", "index", i, "name", t.Name(), "shape", t.Shape())
+		}
 		// Skip pooler layers and position IDs (we do pooling in the runtime)
 		if slices.Contains([]string{
 			"embeddings.position_ids",
@@ -152,28 +159,33 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 
 		name := t.Name()
 
-		// Skip attn_norm for global layers (every 3rd layer starting at 0: 0, 3, 6, 9, 12, 15, 18, 21)
-		// Global layers use full attention and don't have attention output normalization
-		if strings.Contains(name, "attn_norm") {
+		// Skip attention projection bias tensors for global attention layers
+		// Full attention layers don't have attention biases while local attention layers do
+		// Don't skip normalization biases (attn_output_norm.bias)
+		if strings.Contains(name, ".bias") && !strings.Contains(name, "norm") && (strings.Contains(name, "attn") || strings.Contains(name, "attention")) {
+			// Apply layer prefix replacements to parse the layer number correctly
+			layerName := name
+			layerName = strings.Replace(layerName, "encoder.layer.", "blk.", 1)
+			layerName = strings.Replace(layerName, "encoder.layers.", "blk.", 1)
+			layerName = strings.Replace(layerName, "layers.", "blk.", 1)
+
 			var layer int
-			if _, err := fmt.Sscanf(name, "layers.%d.", &layer); err == nil {
+			if _, err := fmt.Sscanf(layerName, "blk.%d.", &layer); err == nil {
 				globalAttnEveryN := cmp.Or(p.GlobalAttnEveryNLayers, 3)
+				// Skip if it's a global layer (multiple of N) - this includes layer 0
 				if layer%int(globalAttnEveryN) == 0 {
-					slog.Debug("skipping attn_norm for global layer", "layer", layer, "name", name)
 					continue
 				}
 			}
 		}
 
-		// ModernBERT uses gated FFN (GeGLU) - the mlp.Wi tensor contains both gate and up weights fused
+
+		// ModernBERT uses GeGLU (Gated GELU) - the mlp.Wi tensor contains both gate and up weights fused
 		// We need to split it into two separate tensors
 		if strings.Contains(name, "mlp.Wi") {
-			// Get the fused tensor data
 			shape := t.Shape()
-			slog.Debug("splitting fused tensor", "name", name, "shape", shape)
 			if len(shape) != 2 {
 				// Unexpected shape, just pass through
-				slog.Warn("unexpected tensor shape for mlp.Wi", "name", name, "shape", shape)
 				out = append(out, &ggml.Tensor{
 					Name:     name,
 					Kind:     t.Kind(),
@@ -184,15 +196,14 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			}
 
 			// PyTorch stores linear weights as [out_features, in_features]
-			// So shape is [2*intermediate_size, hidden_size] = [2304, 768]
+			// For GeGLU, shape is [2*intermediate_size, hidden_size]
 			// We need to split along dim 0 into two tensors of [intermediate_size, hidden_size]
 			dim0 := shape[0]
 			dim1 := shape[1]
 			halfDim0 := dim0 / 2
-			slog.Debug("split dimensions", "dim0", dim0, "dim1", dim1, "halfDim0", halfDim0)
 
 			// Create ffn_gate tensor (first half of rows)
-			// Apply the replacement directly: mlp.Wi -> ffn_gate
+			// ModernBERT's mlp.Wi is organized as [gate; up] (concatenated along dim 0)
 			gateName := strings.Replace(name, "mlp.Wi", "ffn_gate", 1)
 			out = append(out, &ggml.Tensor{
 				Name:     gateName,
@@ -202,7 +213,6 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 			})
 
 			// Create ffn_up tensor (second half of rows)
-			// Apply the replacement directly: mlp.Wi -> ffn_up
 			upName := strings.Replace(name, "mlp.Wi", "ffn_up", 1)
 			out = append(out, &ggml.Tensor{
 				Name:     upName,
@@ -220,7 +230,53 @@ func (p *modernBertModel) Tensors(ts []Tensor) []*ggml.Tensor {
 		}
 	}
 
+	// PRE-NORM Architecture: Layer 0 does NOT have attn_norm in source model (it's Identity/no-op in HuggingFace)
+	// However, llama.cpp graph builder may need a tensor to exist. Create an identity norm (all 1s) for layer 0
+	hasLayer0AttnNorm := false
+	var hiddenSize uint64
+
+	for _, t := range out {
+		if t.Name == "blk.0.attn_output_norm.weight" {
+			hasLayer0AttnNorm = true
+		}
+		// Get hidden size from any layer's attn_output_norm (they all have same size)
+		if strings.Contains(t.Name, "attn_output_norm.weight") {
+			if len(t.Shape) > 0 {
+				hiddenSize = t.Shape[0]
+			}
+		}
+	}
+
+	if !hasLayer0AttnNorm && hiddenSize > 0 {
+		// Create identity LayerNorm for layer 0 (weight=1.0, bias=0.0)
+		out = append(out, &ggml.Tensor{
+			Name:     "blk.0.attn_output_norm.weight",
+			Kind:     tensorKindFP32,
+			Shape:    []uint64{hiddenSize},
+			WriterTo: &identityTensor{size: hiddenSize, value: 1.0},
+		})
+	}
+
 	return out
+}
+
+// identityTensor creates a tensor filled with a constant value
+type identityTensor struct {
+	size  uint64
+	value float32
+}
+
+func (it *identityTensor) WriteTo(w io.Writer) (n int64, err error) {
+	buf := make([]byte, 4)
+	for i := uint64(0); i < it.size; i++ {
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(it.value))
+		written, err := w.Write(buf)
+		n += int64(written)
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // getTensorKindSize returns the size in bytes for each element type
@@ -238,11 +294,116 @@ func getTensorKindSize(kind uint32) uint64 {
 	}
 }
 
+// tensorF32Wrapper wraps a tensor and forces it to be written as F32
+type tensorF32Wrapper struct {
+	source Tensor
+}
+
+func (t *tensorF32Wrapper) Name() string {
+	return t.source.Name()
+}
+
+func (t *tensorF32Wrapper) Kind() uint32 {
+	return tensorKindFP32 // Always return F32
+}
+
+func (t *tensorF32Wrapper) Shape() []uint64 {
+	return t.source.Shape()
+}
+
+func (t *tensorF32Wrapper) SetRepacker(fn Repacker) {
+	t.source.SetRepacker(fn)
+}
+
+func (t *tensorF32Wrapper) WriteTo(w io.Writer) (int64, error) {
+	// Write source to buffer first
+	var buf bytes.Buffer
+	if _, err := t.source.WriteTo(&buf); err != nil {
+		return 0, err
+	}
+
+	// If source is already F32, just write the buffer
+	if t.source.Kind() == tensorKindFP32 {
+		nn, err := w.Write(buf.Bytes())
+		return int64(nn), err
+	}
+
+	// Convert F16 to F32
+	data := buf.Bytes()
+	if t.source.Kind() == tensorKindFP16 {
+		// Read as F16
+		numElements := len(data) / 2
+		f32s := make([]float32, numElements)
+
+		for i := 0; i < numElements; i++ {
+			u16 := uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
+			f32s[i] = float16.Frombits(u16).Float32()
+		}
+
+		// Write as F32
+		return int64(len(f32s) * 4), binary.Write(w, binary.LittleEndian, f32s)
+	}
+
+	// Convert BF16 to F32
+	if t.source.Kind() == tensorKindBF16 {
+		// Read as BF16
+		numElements := len(data) / 2
+		f32s := make([]float32, numElements)
+
+		for i := 0; i < numElements; i++ {
+			// BF16 is just the top 16 bits of F32
+			// To convert: shift BF16 value left by 16 bits
+			u16 := uint16(data[i*2]) | (uint16(data[i*2+1]) << 8)
+			u32 := uint32(u16) << 16
+			f32s[i] = math.Float32frombits(u32)
+		}
+
+		// Write as F32
+		return int64(len(f32s) * 4), binary.Write(w, binary.LittleEndian, f32s)
+	}
+
+	// For other types, just pass through
+	nn, err := w.Write(data)
+	return int64(nn), err
+}
+
+func (t *tensorF32Wrapper) Clone() Tensor {
+	return &tensorF32Wrapper{source: t.source.Clone()}
+}
+
 // splitTensorRows handles splitting a fused tensor along dimension 0 (rows)
 type splitTensorRows struct {
 	source Tensor
 	offset uint64 // starting row
 	rows   uint64 // number of rows to extract
+}
+
+func (st *splitTensorRows) Name() string {
+	return st.source.Name()
+}
+
+func (st *splitTensorRows) Kind() uint32 {
+	return st.source.Kind()
+}
+
+func (st *splitTensorRows) Shape() []uint64 {
+	shape := st.source.Shape()
+	if len(shape) == 2 {
+		return []uint64{st.rows, shape[1]}
+	}
+	return shape
+}
+
+func (st *splitTensorRows) SetRepacker(fn Repacker) {
+	st.source.SetRepacker(fn)
+}
+
+func (st *splitTensorRows) Clone() Tensor {
+	return &splitTensorRows{
+		source: st.source.Clone(),
+		offset: st.offset,
+		rows:   st.rows,
+	}
 }
 
 func (st *splitTensorRows) WriteTo(w io.Writer) (n int64, err error) {
