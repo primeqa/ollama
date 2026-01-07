@@ -1154,13 +1154,6 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         ggml_set_input(inp->tokens);
         res->t_tokens = inp->tokens;
 
-        // DEBUG: Log the actual token IDs being looked up
-        LLAMA_LOG_INFO("[TOKEN_LOOKUP_DEBUG] Looking up %d tokens:\n", (int)ubatch.n_tokens);
-        int n_to_print = ubatch.n_tokens < 10 ? ubatch.n_tokens : 10;
-        for (int i = 0; i < n_to_print; i++) {
-            LLAMA_LOG_INFO("  Token[%d] = %d\n", i, ubatch.token[i]);
-        }
-
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
 
         // apply lora for embedding tokens if needed
@@ -1414,11 +1407,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         //       while for some models F16 is enough, for others it is not, so we default to F32 here
         ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
-        // INSTRUMENTATION: Mark kq tensor for dumping (Q@K^T before scaling)
-        if (il == 0) {
-            ggml_set_output(kq);
-        }
-
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
             // multiply by attn_output_multiplier
@@ -1450,11 +1438,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
 
-        // INSTRUMENTATION: Mark attention weights for dumping (after softmax)
-        if (il == 0) {
-            ggml_set_output(kq);
-        }
-
         if (!v_trans) {
             // note: avoid this branch
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
@@ -1463,11 +1446,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
-
-        // INSTRUMENTATION: Mark kqv for dumping (attention output before permute)
-        if (il == 0) {
-            ggml_set_output(kqv);
-        }
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {

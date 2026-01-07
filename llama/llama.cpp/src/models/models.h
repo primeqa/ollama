@@ -546,17 +546,3 @@ struct llm_build_wavtokenizer_dec : public llm_graph_context {
 struct llm_build_xverse : public llm_graph_context {
     llm_build_xverse(const llama_model & model, const llm_graph_params & params);
 };
-
-// Debug tensor tracking for ModernBERT
-#include "../llama-impl.h"
-#include <vector>
-#include <string>
-
-struct debug_tensor_info {
-    ggml_tensor * tensor;
-    std::string name;
-    int layer;
-};
-
-std::vector<debug_tensor_info> & llm_get_debug_tensors();
-bool llm_debug_layers_enabled();

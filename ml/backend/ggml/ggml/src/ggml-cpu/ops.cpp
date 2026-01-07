@@ -5162,17 +5162,6 @@ static void ggml_compute_forward_soft_max_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
-    // INSTRUMENTATION: Log every call to F32 version
-    {
-        FILE* f = fopen("/tmp/ggml_softmax_f32_calls.log", "a");
-        if (f) {
-            fprintf(f, "ggml_compute_forward_soft_max_f32 called! ith=%d nth=%d\n",
-                    params->ith, params->nth);
-            fflush(f);
-            fclose(f);
-        }
-    }
-
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * src2 = dst->src[2];
@@ -5270,33 +5259,6 @@ static void ggml_compute_forward_soft_max_f32(
                 sum = 1.0/sum;
                 ggml_vec_scale_f32(ne00, dp, sum);
 
-                // INSTRUMENTATION: Dump softmax values for debugging
-                // Use thread-safe approach with unique filenames
-                static int total_dumps = 0;
-                if (total_dumps < 20 && i02 == 0 && i01 < 3) {  // Head 0, first 3 queries, up to 20 dumps
-                    char filename[256];
-                    snprintf(filename, sizeof(filename), "/tmp/ggml_softmax_%d_%lld_%lld.txt",
-                             total_dumps, (long long)i01, (long long)i02);
-                    FILE* dump_file = fopen(filename, "w");
-                    if (dump_file) {
-                        fprintf(dump_file, "[SOFTMAX] i01=%lld i02=%lld i03=%lld ne00=%lld max=%.6f sum=%.6f\n",
-                                (long long)i01, (long long)i02, (long long)i03,
-                                (long long)ne00, max, 1.0/sum);
-                        fprintf(dump_file, "Input (scaled scores):");
-                        for (int j = 0; j < ne00 && j < 8; j++) {
-                            fprintf(dump_file, " %.6f", wp[j]);
-                        }
-                        fprintf(dump_file, "\nOutput (attention weights):");
-                        for (int j = 0; j < ne00 && j < 8; j++) {
-                            fprintf(dump_file, " %.6f", dp[j]);
-                        }
-                        fprintf(dump_file, "\n");
-                        fflush(dump_file);
-                        fclose(dump_file);
-                        total_dumps++;
-                    }
-                }
-
 #ifndef NDEBUG
                 for (int i = 0; i < ne00; ++i) {
                     assert(!isnan(dp[i]));
@@ -5311,16 +5273,6 @@ static void ggml_compute_forward_soft_max_f32(
 void ggml_compute_forward_soft_max(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
-
-    // INSTRUMENTATION: Log every call
-    {
-        FILE* f = fopen("/tmp/ggml_softmax_calls.log", "a");
-        if (f) {
-            fprintf(f, "ggml_compute_forward_soft_max called! type=%d\n", (int)dst->src[0]->type);
-            fflush(f);
-            fclose(f);
-        }
-    }
 
     const ggml_tensor * src0 = dst->src[0];
 

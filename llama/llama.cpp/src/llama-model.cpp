@@ -935,27 +935,19 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
                 ml.get_key(LLM_KV_POOLING_NORMALIZE_EMBEDDINGS, hparams.normalize_embeddings, false);
 
-                LLAMA_LOG_INFO("[ModernBERT DEBUG] global_attn_every_n_layers=%u, local_attn_window=%u\n",
-                               hparams.global_attn_every_n_layers, hparams.local_attn_window);
-
                 // Set up sliding window attention for local layers
                 if (hparams.global_attn_every_n_layers > 0 && hparams.local_attn_window > 0) {
                     hparams.n_swa = hparams.local_attn_window;
                     hparams.set_swa_pattern(hparams.global_attn_every_n_layers, true);  // dense_first = true
 
-                    LLAMA_LOG_INFO("[ModernBERT DEBUG] is_swa_any()=%d\n", hparams.is_swa_any());
-
                     // Only enable SWA if there are actually layers that use it
                     if (hparams.is_swa_any()) {
                         hparams.swa_type = LLAMA_SWA_TYPE_SYMMETRIC;  // bidirectional SWA for encoder
-                        LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to SYMMETRIC\n");
                     } else {
                         hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-                        LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to NONE (no SWA layers found)\n");
                     }
                 } else {
                     hparams.swa_type = LLAMA_SWA_TYPE_NONE;
-                    LLAMA_LOG_INFO("[ModernBERT DEBUG] swa_type set to NONE (missing params)\n");
                 }
 
                 if (hparams.n_layer == 22 && hparams.n_embd == 768) {
