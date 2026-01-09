@@ -937,8 +937,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_GLOBAL_ATTN_EVERY_N_LAYERS, hparams.global_attn_every_n_layers, (uint32_t)0);
                 ml.get_key(LLM_KV_ATTENTION_LOCAL_ATTN_WINDOW, hparams.local_attn_window, (uint32_t)0);
                 ml.get_key(LLM_KV_ROPE_FREQ_BASE_LOCAL,  hparams.rope_freq_base_local,  10000.0f);
-                ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 10000.0f);
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_GLOBAL, hparams.rope_freq_base_global, 80000.0f);
                 ml.get_key(LLM_KV_POOLING_NORMALIZE_EMBEDDINGS, hparams.normalize_embeddings, false);
+
+                // Copy RoPE frequencies to the fields used by get_rope_freq_base
+                hparams.rope_freq_base_train = hparams.rope_freq_base_global;      // For global (non-SWA) layers
+                hparams.rope_freq_base_train_swa = hparams.rope_freq_base_local;   // For local (SWA) layers
 
                 // Set up sliding window attention for local layers
                 if (hparams.global_attn_every_n_layers > 0 && hparams.local_attn_window > 0) {
