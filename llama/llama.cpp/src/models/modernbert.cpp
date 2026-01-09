@@ -1,21 +1,8 @@
 #include "models.h"
 #include "../llama-impl.h"
 #include <stdexcept>
-#include <cstdlib>
-#include <cstring>
-
-// Global flag for layer-by-layer debugging
-static bool g_debug_layer_outputs = false;
 
 llm_build_modernbert::llm_build_modernbert(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    // Check if layer output debugging is enabled
-    const char* debug_env = std::getenv("OLLAMA_DEBUG_LAYER_OUTPUTS");
-    g_debug_layer_outputs = (debug_env != nullptr && std::strcmp(debug_env, "1") == 0);
-
-    if (g_debug_layer_outputs) {
-        LLAMA_LOG_INFO("[LAYER_DEBUG] Layer-by-layer output debugging ENABLED for ModernBERT\n");
-    }
-
     const int64_t n_embd_head = hparams.n_embd_head_v;
     const int64_t n_embd_gqa  = hparams.n_embd_v_gqa();
 
@@ -279,14 +266,6 @@ llm_build_modernbert::llm_build_modernbert(const llama_model & model, const llm_
         // Protect layer outputs for ModernBERT
         if (model.arch == LLM_ARCH_MODERNBERT) {
             ggml_set_output(inpL);
-
-            // Mark layer output for debugging if enabled
-            if (g_debug_layer_outputs) {
-                char layer_name[64];
-                snprintf(layer_name, sizeof(layer_name), "layer_%02d_output", il);
-                ggml_set_name(inpL, layer_name);
-                cb(inpL, layer_name, il);
-            }
         }
     }
 
