@@ -8,11 +8,11 @@ from transformers import AutoTokenizer, AutoModel
 import torch.nn.functional as F
 import requests
 
-model_path = "/tmp/tiny-modernbert"
-tokenizer = AutoTokenizer.from_pretrained(model_path)
-model = AutoModel.from_pretrained(model_path, attn_implementation="eager")
+model_path = "/home/raduf/sandbox2/ollama/models/granite-r2-real"
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+model = AutoModel.from_pretrained(model_path, attn_implementation="eager", trust_remote_code=True, local_files_only=True)
 
-text = "Hello world"
+text = "1975"
 inputs = tokenizer(text, return_tensors="pt")
 
 # Get HF embeddings
@@ -21,8 +21,8 @@ with torch.no_grad():
     hf_embeddings = outputs.last_hidden_state[0]  # [n_tokens, hidden_size]
 
 # Get Ollama embedding
-response = requests.post('http://127.0.0.1:11434/api/embed', json={
-    'model': 'tiny-modernbert',
+response = requests.post('http://127.0.0.1:13000/api/embed', json={
+    'model': 'granite-r2',
     'input': text
 })
 ollama_raw = np.array(response.json()['embeddings'][0])

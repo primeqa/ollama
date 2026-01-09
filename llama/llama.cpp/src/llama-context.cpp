@@ -90,6 +90,10 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
+    // DEBUG: Force disable flash attention for testing
+    cparams.flash_attn = false;
+    LLAMA_LOG_WARN("⚠️  [DEBUG] Flash attention FORCE DISABLED for testing!\n");
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -900,6 +904,59 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_tensor_get_async(backend_res, t_logits, logits, 0, n_tokens*n_vocab*sizeof(float));
     }
 
+    // DEBUG: Dump all output tensors if environment variable is set
+    const char* dump_outputs_env = std::getenv("OLLAMA_DUMP_OUTPUTS");
+    if (dump_outputs_env != nullptr && std::strcmp(dump_outputs_env, "1") == 0) {
+        // Open file for appending
+        FILE* dump_file = fopen("/tmp/ollama_tensor_dump.txt", "a");
+        if (dump_file) {
+            fprintf(dump_file, "\n=== BATCH START (n_tokens=%d) ===\n", n_tokens);
+
+            // Iterate through all tensors in the graph
+            auto * gf = res->get_gf();
+            if (gf) {
+                for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                    struct ggml_tensor * tensor = ggml_graph_node(gf, i);
+
+                    // Check if tensor is marked as output
+                    if (tensor && (tensor->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+                        if (backend && tensor->type == GGML_TYPE_F32) {
+                            // Calculate total elements
+                            int64_t n_elements = 1;
+                            for (int d = 0; d < GGML_MAX_DIMS && tensor->ne[d] > 1; d++) {
+                                n_elements *= tensor->ne[d];
+                            }
+
+                            // Limit to first 1000 elements to avoid huge dumps
+                            n_elements = n_elements < 1000 ? n_elements : 1000;
+
+                            // Allocate buffer and get tensor data
+                            std::vector<float> data(n_elements);
+                            ggml_backend_tensor_get(tensor, data.data(), 0, n_elements * sizeof(float));
+
+                            // Write to file
+                            fprintf(dump_file, "\nTensor: %s\n", tensor->name);
+                            fprintf(dump_file, "  Shape: [%lld, %lld, %lld, %lld]\n",
+                                    (long long)tensor->ne[0], (long long)tensor->ne[1],
+                                    (long long)tensor->ne[2], (long long)tensor->ne[3]);
+                            fprintf(dump_file, "  Type: %d\n", tensor->type);
+                            fprintf(dump_file, "  First 64 values:\n  ");
+                            for (int j = 0; j < 64 && j < n_elements; j++) {
+                                fprintf(dump_file, "%.6f ", data[j]);
+                                if ((j + 1) % 8 == 0) fprintf(dump_file, "\n  ");
+                            }
+                            fprintf(dump_file, "\n");
+                        }
+                    }
+                }
+            }
+
+            fprintf(dump_file, "=== BATCH END ===\n");
+            fclose(dump_file);
+        }
+    }
+
     // extract embeddings
     if (embd && t_embd) {
         ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
@@ -1500,6 +1557,76 @@ ggml_status llama_context::graph_compute(
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+
+    // INSTRUMENTATION: Dump tensors after graph computation for debugging
+    const char* dump_tensors_env = std::getenv("OLLAMA_DUMP_TENSORS");
+    if (dump_tensors_env && std::strcmp(dump_tensors_env, "1") == 0) {
+        FILE* dump_file = fopen("/tmp/ollama_tensor_values.txt", "a");
+        if (dump_file) {
+            fprintf(dump_file, "\n\n=== GRAPH COMPUTATION COMPLETE ===\n");
+            fprintf(dump_file, "n_nodes: %d\n", ggml_graph_n_nodes(gf));
+
+            // Iterate through all graph nodes and dump tensors marked as output
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                struct ggml_tensor * node = ggml_graph_node(gf, i);
+                if (node && (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    const char* name = ggml_get_name(node);
+                    fprintf(dump_file, "\n--- OUTPUT TENSOR [%d]: %s ---\n", i, name ? name : "unnamed");
+                    fprintf(dump_file, "Type: %s\n", ggml_type_name(node->type));
+                    fprintf(dump_file, "Shape: [%lld, %lld, %lld, %lld]\n",
+                            (long long)node->ne[0], (long long)node->ne[1],
+                            (long long)node->ne[2], (long long)node->ne[3]);
+
+                    // Dump first few values
+                    if (node->data) {
+                        int64_t n_elem = node->ne[0] * node->ne[1] * node->ne[2] * node->ne[3];
+                        int64_t n_dump = n_elem < 2048 ? n_elem : 2048;  // Increased from 32 to 2048
+
+                        if (node->type == GGML_TYPE_F32) {
+                            float* data = (float*)node->data;
+                            fprintf(dump_file, "First %lld values (F32):\n", (long long)n_dump);
+                            for (int64_t j = 0; j < n_dump; j++) {
+                                fprintf(dump_file, "  [%lld] = %.8f\n", (long long)j, data[j]);
+                            }
+                            // Statistics
+                            float min_val = data[0], max_val = data[0];
+                            double sum = 0.0;
+                            for (int64_t j = 0; j < n_elem; j++) {
+                                if (data[j] < min_val) min_val = data[j];
+                                if (data[j] > max_val) max_val = data[j];
+                                sum += data[j];
+                            }
+                            fprintf(dump_file, "Stats: min=%.8f, max=%.8f, mean=%.8f\n",
+                                    min_val, max_val, sum / n_elem);
+                        } else if (node->type == GGML_TYPE_F16) {
+                            ggml_fp16_t* data = (ggml_fp16_t*)node->data;
+                            fprintf(dump_file, "First %lld values (F16 converted to F32):\n", (long long)n_dump);
+                            for (int64_t j = 0; j < n_dump; j++) {
+                                fprintf(dump_file, "  [%lld] = %.8f\n", (long long)j,
+                                        ggml_fp16_to_fp32(data[j]));
+                            }
+                            float min_val = ggml_fp16_to_fp32(data[0]);
+                            float max_val = ggml_fp16_to_fp32(data[0]);
+                            double sum = 0.0;
+                            for (int64_t j = 0; j < n_elem; j++) {
+                                float val = ggml_fp16_to_fp32(data[j]);
+                                if (val < min_val) min_val = val;
+                                if (val > max_val) max_val = val;
+                                sum += val;
+                            }
+                            fprintf(dump_file, "Stats: min=%.8f, max=%.8f, mean=%.8f\n",
+                                    min_val, max_val, sum / n_elem);
+                        }
+                    } else {
+                        fprintf(dump_file, "No data available\n");
+                    }
+                }
+            }
+            fprintf(dump_file, "=== END GRAPH DUMP ===\n\n");
+            fflush(dump_file);
+            fclose(dump_file);
+        }
+    }
 
     return status;
 }
