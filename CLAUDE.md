@@ -18,16 +18,24 @@ go clean -cache
 
 ### Native Code (GPU Support)
 ```bash
-# Configure with CMake
+# Configure with CMake (unoptimized, for development)
 cmake -B build
+cmake --build build
 
-# Build with CMake
+# Configure with CMake (optimized, for production/benchmarking)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 # For specific configurations (e.g., ROCm on Windows)
 cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake --build build --config Release
 ```
+
+**Build Types:**
+- No `CMAKE_BUILD_TYPE`: Unoptimized (no `-O` flags) - faster compile, slower runtime
+- `Release`: Optimized with `-O3 -DNDEBUG` - slower compile, fastest runtime
+- `RelWithDebInfo`: Optimized with debug symbols `-O2 -g -DNDEBUG`
+- `Debug`: Debug symbols, no optimization `-g`
 
 ### Docker Build
 ```bash
@@ -181,3 +189,63 @@ Ollama looks for acceleration libraries relative to the `ollama` executable:
 - `../lib/ollama` (Linux)
 - `.` (macOS)
 - `build/lib/ollama` (development)
+
+## Debugging
+
+### Environment Variables for Debugging
+
+**General Debug Logging:**
+```bash
+# Enable debug logging (levels: 0=INFO, 1=DEBUG, 2=TRACE)
+OLLAMA_DEBUG=1 ./ollama serve
+
+# More verbose trace logging
+OLLAMA_DEBUG=2 ./ollama serve
+```
+
+**GPU/Library Debugging:**
+```bash
+# Force specific LLM library (bypass auto-detection)
+OLLAMA_LLM_LIBRARY="cpu_avx2" ./ollama serve
+
+# AMD ROCm debugging
+AMD_LOG_LEVEL=3 ./ollama serve
+```
+
+**Model-Specific Debug Variables (development only):**
+```bash
+OLLAMA_DEBUG_LAYERS=1          # Layer-by-layer tensor debugging
+OLLAMA_DEBUG_ACTIVATIONS=1     # Dump activation tensors
+OLLAMA_DEBUG_TOKEN_20778=1     # Debug specific token (ModernBERT)
+OLLAMA_DUMP_TENSOR_VALUES=1    # Dump tensor values to file
+OLLAMA_DEBUG_DISABLE_ROPE=1    # Disable RoPE (for testing)
+```
+
+### Log Locations
+
+- **macOS**: `~/.ollama/logs/server.log`
+- **Linux (systemd)**: `journalctl -u ollama --no-pager`
+- **Linux (manual)**: stdout/stderr of `ollama serve`
+- **Windows**: `%LOCALAPPDATA%\Ollama\server.log`
+- **Docker**: `docker logs <container-name>`
+
+### GGML Debug Levels
+
+The GGML library has compile-time debug levels in `ml/backend/ggml/ggml/src/ggml-impl.h`:
+```c
+#define GGML_DEBUG 0  // Set to 1, 5, or 10 for increasing verbosity
+```
+
+To enable GGML debug output, rebuild with the appropriate level. Note: This requires modifying the source and recompiling.
+
+### Debugging Scripts
+
+Debug scripts for model development are in `scripts/debug/`:
+- `compare_embedding_lookup.py` - Compare embeddings between implementations
+- `detailed_layer_comparison.py` - Layer-by-layer activation comparison
+- `dump_layer_outputs.py` - Dump intermediate layer outputs
+- `extract_ollama_qkv.py` - Extract Q/K/V values from attention
+
+### CPU Debug Build
+
+The CPU backend includes an `OLLAMA_DEBUG` preprocessor flag (`ml/backend/ggml/ggml/src/ggml-cpu/cpu_debug.go`) that enables additional tensor debugging hooks when building with CGO.
