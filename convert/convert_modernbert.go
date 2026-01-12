@@ -89,7 +89,7 @@ func (p *modernBertModel) parseMore(fsys fs.FS) error {
 	return nil
 }
 
-func (p *modernBertModel) KV(t *Tokenizer) ggml.KV {
+func (p *modernBertModel) KV(t *Tokenizer) KV {
 	slog.Info("=== ModernBERT KV() called ===")
 	slog.Info("Tokenizer.Pre value from tokenizer.go", "pre", t.Pre)
 	kv := p.ModelParameters.KV(t)
