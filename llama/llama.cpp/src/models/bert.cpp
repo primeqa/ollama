@@ -21,14 +21,14 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     cb(inpL, "tok_embd_lookup", -1);
 
     // For ModernBERT, mark embedding result as output to prevent buffer reuse
-    if (model.arch == LLM_ARCH_MODERNBERT) {
+    if (model.arch == LLM_ARCH_MODERN_BERT) {
         ggml_set_output(inpL);
     }
 
     // token types are hardcoded to zero ("Sentence A")
     if (model.type_embd) {
         ggml_tensor * type_row0 = ggml_view_1d(ctx0, model.type_embd, n_embd, 0);
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             // For ModernBERT, force explicit copy of operands to avoid memory aliasing
             ggml_tensor* inpL_copy = ggml_dup_tensor(ctx0, inpL);
             inpL_copy = ggml_cpy(ctx0, inpL, inpL_copy);
@@ -49,7 +49,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     cb(inpL, "inp_embd", -1);
 
     // Protect embeddings before norm for ModernBERT
-    if (model.arch == LLM_ARCH_MODERNBERT) {
+    if (model.arch == LLM_ARCH_MODERN_BERT) {
         ggml_set_output(inpL);
     }
 
@@ -58,7 +58,7 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     cb(inpL, "inp_norm", -1);
 
     // Protect normalized embeddings for ModernBERT
-    if (model.arch == LLM_ARCH_MODERNBERT) {
+    if (model.arch == LLM_ARCH_MODERN_BERT) {
         ggml_set_output(inpL);
     }
 
@@ -67,11 +67,21 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
     ggml_tensor * inp_out_ids = nullptr;
 
     // ModernBERT: Check if we need alternating attention pattern
-    const bool use_alternating_attn = (model.arch == LLM_ARCH_MODERNBERT &&
+    const bool use_alternating_attn = (model.arch == LLM_ARCH_MODERN_BERT &&
                                        hparams.global_attn_every_n_layers > 0);
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * cur = inpL;
+
+        // PRE-NORM: Apply attn_norm BEFORE attention computation (for ModernBERT)
+        // ModernBERT layer 0 has no attn_norm (acts as identity), layers 1+ have it
+        ggml_tensor * attn_residual_base = cur;  // Save unnormalized input for residual add
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
+            if (model.layers[il].attn_norm) {
+                cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM, il);
+                cb(cur, "attn_norm", il);
+            }
+        }
 
         {
             ggml_tensor * Qcur;
@@ -80,15 +90,12 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
             // self-attention
             // Check for ModernBERT that critical tensors exist
-            if (model.arch == LLM_ARCH_MODERNBERT) {
+            if (model.arch == LLM_ARCH_MODERN_BERT) {
                 if (!model.layers[il].wqkv && (!model.layers[il].wq || !model.layers[il].wk || !model.layers[il].wv)) {
                     throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention weight tensors");
                 }
                 if (!model.layers[il].wo) {
                     throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output tensor (wo)");
-                }
-                if (!model.layers[il].attn_out_norm) {
-                    throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing attention output norm tensor");
                 }
             }
 
@@ -131,11 +138,11 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
 
             // RoPE
             if (model.arch == LLM_ARCH_NOMIC_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
-                model.arch == LLM_ARCH_JINA_BERT_V3 || model.arch == LLM_ARCH_MODERNBERT) {
+                model.arch == LLM_ARCH_JINA_BERT_V3 || model.arch == LLM_ARCH_MODERN_BERT) {
 
                 // Get per-layer RoPE frequency for ModernBERT (global vs local)
-                const float freq_base_l  = model.arch == LLM_ARCH_MODERNBERT ? model.get_rope_freq_base(cparams, il)  : freq_base;
-                const float freq_scale_l = model.arch == LLM_ARCH_MODERNBERT ? model.get_rope_freq_scale(cparams, il) : freq_scale;
+                const float freq_base_l  = model.arch == LLM_ARCH_MODERN_BERT ? model.get_rope_freq_base(cparams, il)  : freq_base;
+                const float freq_scale_l = model.arch == LLM_ARCH_MODERN_BERT ? model.get_rope_freq_scale(cparams, il) : freq_scale;
 
                 Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                                      ext_factor, attn_factor, beta_fast, beta_slow);
@@ -159,24 +166,25 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
 
-        // Protect residual add operands and result for ModernBERT
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        // PRE-NORM: Add attention output to UNNORMALIZED input for ModernBERT
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             ggml_set_output(cur);
-            ggml_set_output(inpL);
-        }
-        cur = ggml_add(ctx0, cur, inpL);
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+            ggml_set_output(attn_residual_base);
+            cur = ggml_add(ctx0, cur, attn_residual_base);
             ggml_set_output(cur);
+        } else {
+            cur = ggml_add(ctx0, cur, inpL);
         }
 
-        // For ModernBERT, save the value BEFORE normalization for FFN residual add
+        // PRE-NORM: Save the value BEFORE mlp_norm for FFN residual add
         ggml_tensor * ffn_residual_base = cur;
 
-        // attention layer norm
-        // ModernBERT layer 0 has NO attn_out_norm tensor, all other layers have it
-        if (model.arch == LLM_ARCH_MODERNBERT && il == 0) {
-            // Layer 0: Skip attn_out_norm (tensor doesn't exist)
+        // PRE-NORM: Apply ffn_norm BEFORE FFN computation for ModernBERT
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
+            cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM, il);
+            cb(cur, "ffn_norm", il);
         } else {
+            // POST-NORM: Apply attention layer norm AFTER attention for other BERT models
             cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
         }
 
@@ -202,16 +210,13 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
-        } else if (model.arch == LLM_ARCH_MODERNBERT) {
-            // ModernBERT uses GeGLU (Gated GELU) activation with no bias terms
-            if (model.layers[il].ffn_gate == nullptr || model.layers[il].ffn_up == nullptr || model.layers[il].ffn_down == nullptr) {
-                throw std::runtime_error("ModernBERT layer " + std::to_string(il) + " missing required FFN tensors");
-            }
+        } else if (model.arch == LLM_ARCH_MODERN_BERT) {
+            // ModernBERT uses GeGLU (Gated GELU) - upstream uses combined ffn_up tensor with GEGLU
             cur = build_ffn(cur,
                     model.layers[il].ffn_up, NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
+                    NULL, NULL, NULL,
                     model.layers[il].ffn_down, NULL, NULL, NULL,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GEGLU, LLM_FFN_SEQ, il);
             cb(cur, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
             cur = build_ffn(cur,
@@ -230,24 +235,24 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         }
 
         // Protect FFN residual add operands for ModernBERT
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             ggml_set_output(cur);
             ggml_set_output(ffn_residual_base);
         }
 
         // For ModernBERT, add FFN output to the UNNORMALIZED value (ffn_residual_base)
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             cur = ggml_add(ctx0, cur, ffn_residual_base);
         } else {
             cur = ggml_add(ctx0, cur, ffn_inp);
         }
 
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             ggml_set_output(cur);
         }
 
-        // output layer norm (not for ModernBERT which has no layer_out_norm)
-        if (model.arch != LLM_ARCH_MODERNBERT) {
+        // POST-NORM: Apply output layer norm AFTER FFN (not for ModernBERT which uses PRE-NORM)
+        if (model.arch != LLM_ARCH_MODERN_BERT) {
             cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
         }
 
@@ -255,21 +260,21 @@ llm_build_bert::llm_build_bert(const llama_model & model, const llm_graph_params
         inpL = cur;
 
         // Protect layer outputs for ModernBERT
-        if (model.arch == LLM_ARCH_MODERNBERT) {
+        if (model.arch == LLM_ARCH_MODERN_BERT) {
             ggml_set_output(inpL);
         }
     }
 
     cur = inpL;
 
-    // ModernBERT does NOT have output_norm, only apply for other BERT models
-    if (model.arch != LLM_ARCH_MODERNBERT && model.output_norm) {
+    // Apply final output norm (all BERT variants including ModernBERT have this)
+    if (model.output_norm) {
         cur = build_norm(cur, model.output_norm, model.output_norm_b, LLM_NORM, -1);
         cb(cur, "result_norm", -1);
     }
 
     // Apply L2 normalization if requested (for sentence-transformers models)
-    if (model.arch == LLM_ARCH_MODERNBERT && hparams.normalize_embeddings) {
+    if (model.arch == LLM_ARCH_MODERN_BERT && hparams.normalize_embeddings) {
         cur = ggml_l2_norm(ctx0, cur, 1e-12f);
         cb(cur, "result_l2_norm", -1);
     }

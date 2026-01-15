@@ -25,7 +25,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NEO_BERT,         "neo-bert"         },
     { LLM_ARCH_JINA_BERT_V2,     "jina-bert-v2"     },
     { LLM_ARCH_JINA_BERT_V3,     "jina-bert-v3"     },
-       { LLM_ARCH_MODERNBERT,           "modernbert"       },
+    { LLM_ARCH_MODERN_BERT,      "modern-bert"      },
     { LLM_ARCH_BLOOM,            "bloom"            },
     { LLM_ARCH_STABLELM,         "stablelm"         },
     { LLM_ARCH_QWEN,             "qwen"             },
@@ -818,20 +818,19 @@ static std::set<llm_tensor> llm_get_tensor_names(llm_arch arch) {
                 LLM_TENSOR_FFN_UP,
                 LLM_TENSOR_LAYER_OUT_NORM,
             };
-        case LLM_ARCH_MODERNBERT:
+        case LLM_ARCH_MODERN_BERT:
             return {
                 LLM_TENSOR_TOKEN_EMBD,
                 LLM_TENSOR_TOKEN_EMBD_NORM,
                 LLM_TENSOR_OUTPUT_NORM,
-                LLM_TENSOR_ATTN_OUT_NORM,
-                LLM_TENSOR_ATTN_QKV,
-                LLM_TENSOR_ATTN_Q_NORM,
-                LLM_TENSOR_ATTN_K_NORM,
+                LLM_TENSOR_ATTN_NORM,
                 LLM_TENSOR_ATTN_OUT,
-                LLM_TENSOR_LAYER_OUT_NORM,
+                LLM_TENSOR_ATTN_QKV,
                 LLM_TENSOR_FFN_DOWN,
                 LLM_TENSOR_FFN_UP,
-                LLM_TENSOR_FFN_GATE,
+                LLM_TENSOR_FFN_NORM,
+                LLM_TENSOR_CLS,
+                LLM_TENSOR_CLS_OUT,
             };
         case LLM_ARCH_BLOOM:
             return {

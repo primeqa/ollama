@@ -155,7 +155,7 @@ func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.C
 	}
 
 	// ModernBERT embedding models need full context for proper truncation handling
-	if model.Config.ModelFamily == "modernbert" {
+	if model.Config.ModelFamily == "modern-bert" {
 		if f, err := gguf.Open(model.ModelPath); err == nil {
 			defer f.Close()
 			// KeyValue() auto-prepends architecture, so just use "context_length"
