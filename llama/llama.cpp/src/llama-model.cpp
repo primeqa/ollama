@@ -3148,6 +3148,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_NOMIC_BERT:
             case LLM_ARCH_NOMIC_BERT_MOE:
             case LLM_ARCH_JINA_BERT_V3:
+            case LLM_ARCH_MODERNBERT:
                 {
                     tok_embd     = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
                     type_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_TYPES, "weight"), {n_embd, n_token_types}, TENSOR_NOT_REQUIRED);
@@ -3198,7 +3199,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
                             layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, TENSOR_NOT_REQUIRED);
 
-                            if (arch == LLM_ARCH_NOMIC_BERT) {
+                            if (arch == LLM_ARCH_NOMIC_BERT || arch == LLM_ARCH_MODERNBERT) {
+                                // ModernBERT and NOMIC_BERT use gated FFN (GeGLU/SwiGLU)
                                 layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
                             }
                         }
@@ -7359,6 +7361,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_MODERN_BERT:
             {
                 llm = std::make_unique<llm_build_bert>(*this, params);
+            } break;
+        case LLM_ARCH_MODERNBERT:
+            {
+                llm = std::make_unique<llm_build_modernbert>(*this, params);
             } break;
         case LLM_ARCH_NEO_BERT:
             {
